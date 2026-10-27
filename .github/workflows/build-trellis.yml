@@ -1,0 +1,218 @@
+name: build-trellis.yml
+
+# Builds SeasonRealms/trellis.cpp for Windows x64 with the GGML revision that the
+# fork itself pins in thirdparty/ggml (.gitmodules -> pwilkin/ggml, branch
+# "trellis"). The submodule commit recorded in the trellis.cpp tree is the
+# version pin: this workflow never re-points or patches it, so the GGML ABI in
+# the produced binaries is exactly the one trellis.cpp is developed against.
+# Freezing the build = passing a commit/tag in trellis_ref; the resolved
+# trellis.cpp and GGML commits are printed, written to the artifact manifest and
+# recorded in the job summary so a later run can be reproduced commit-for-commit.
+#
+# Season3D consumes the result as an isolated worker: GGML and trellis_core are
+# linked statically into trellis-cli.exe / trellis-server.exe, so nothing here
+# can collide with the shared ggml-*.dll that SeasonGGML ships for the other AI
+# libraries. Only the CUDA runtime DLLs are shipped alongside when the cuda
+# backend is selected.
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "CMake build type"
+        required: true
+        type: choice
+        default: "Release"
+        options:
+          - Release
+          - Debug
+      trellis_ref:
+        description: "SeasonRealms/trellis.cpp tag / branch / commit (a commit or tag freezes the build)"
+        required: true
+        default: "main"
+      backend:
+        description: "GGML backend compiled into trellis"
+        required: true
+        type: choice
+        default: "cuda"
+        options:
+          - cuda
+          - cpu
+      cuda_version:
+        description: "CUDA Toolkit version (cuda backend only), aligned with SeasonGGML / SeasonTTS"
+        required: false
+        default: "12.8.1"
+      cuda_architectures:
+        description: "CUDA architectures (cuda backend only; 89-real covers the RTX 4090)"
+        required: false
+        default: "75-virtual;80-real;86-real;89-real;90-virtual"
+      trellis_webp:
+        description: "Encode GLB textures as WebP (EXT_texture_webp); OFF exports PNG"
+        required: true
+        type: choice
+        default: "ON"
+        options:
+          - "ON"
+          - "OFF"
+      build_parallel:
+        description: "Parallel build jobs"
+        required: false
+        default: "4"
+
+permissions:
+  contents: read
+
+env:
+  TRELLIS_REPO: SeasonRealms/trellis.cpp
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2022
+    # Windows CUDA builds of ggml + trellis across five architectures are long;
+    # upstream also allows a generous budget for this leg.
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout ${{ env.TRELLIS_REPO }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TRELLIS_REPO }}
+          ref: ${{ github.event.inputs.trellis_ref }}
+          path: trellis-src
+          # Recursive: thirdparty/ggml is checked out at the commit pinned by the
+          # trellis.cpp tree itself, which is the GGML version this build ships.
+          submodules: recursive
+
+      - name: Record pinned revisions
+        shell: pwsh
+        run: |
+          $trellisCommit = (git -C trellis-src rev-parse HEAD).Trim()
+          $ggmlUrl = (git -C trellis-src config -f .gitmodules --get submodule.thirdparty/ggml.url).Trim()
+          $ggmlStatus = git -C trellis-src submodule status thirdparty/ggml
+          # " f8697b3... thirdparty/ggml (heads/trellis)" -> SHA
+          $ggmlCommit = (($ggmlStatus -replace '^\s*[+\-U]?', '') -split '\s+')[0]
+
+          "TRELLIS_COMMIT=$trellisCommit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "GGML_URL=$ggmlUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "GGML_COMMIT=$ggmlCommit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          @(
+            "trellis.cpp: $trellisCommit"
+            "ggml:        $ggmlCommit ($ggmlUrl)"
+          ) | ForEach-Object {
+            Write-Host $_
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $_
+          }
+
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install CUDA Toolkit
+        if: github.event.inputs.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "${{ github.event.inputs.cuda_version }}"
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          $cmakeArgs = @(
+            '-S', 'trellis-src',
+            '-B', 'build',
+            '-G', 'Ninja',
+            "-DCMAKE_BUILD_TYPE=${{ github.event.inputs.configuration }}",
+            # GGML_NATIVE=OFF keeps the CPU path off the runner's own ISA so the
+            # binaries stay portable; GGML_OPENMP=OFF drops the libomp runtime
+            # dependency (mirrors upstream's Windows packaging).
+            '-DGGML_NATIVE=OFF',
+            '-DGGML_OPENMP=OFF',
+            "-DTRELLIS_WEBP=${{ github.event.inputs.trellis_webp }}"
+          )
+
+          if ('${{ github.event.inputs.backend }}' -eq 'cuda') {
+            $cmakeArgs += '-DGGML_CUDA=ON'
+            $cmakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=${{ github.event.inputs.cuda_architectures }}"
+          }
+
+          Write-Host "Running: cmake $($cmakeArgs -join ' ')"
+          & cmake @cmakeArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build trellis-cli and trellis-server
+        shell: pwsh
+        run: |
+          & cmake --build build --target trellis-cli trellis-server --parallel "${{ github.event.inputs.build_parallel }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "out/runtimes/win-x64/native"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          Copy-Item build/trellis-cli.exe $out -Force
+          Copy-Item build/trellis-server.exe $out -Force
+
+          Copy-Item trellis-src/LICENSE -Destination (Join-Path $out "trellis.txt") -Force
+          Copy-Item trellis-src/thirdparty/ggml/LICENSE -Destination (Join-Path $out "ggml.txt") -Force
+
+          if ('${{ github.event.inputs.backend }}' -eq 'cuda') {
+            # The CUDA runtime is not part of the binary: ship cudart/cublas next
+            # to the executables. CUDA 13 moved the Windows DLLs into bin/x64, so
+            # search the toolkit recursively and fail loudly when a DLL is absent.
+            $cudaRoot = $env:CUDA_PATH
+            if (-not $cudaRoot) { throw "CUDA_PATH is not set" }
+
+            foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+              $dll = Get-ChildItem -Path $cudaRoot -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+              if (-not $dll) { throw "$pattern not found under $cudaRoot" }
+              Write-Host "Bundling $($dll.Name)"
+              Copy-Item $dll.FullName $out -Force
+            }
+          }
+
+          $manifest = @(
+            "trellis.cpp : $env:TRELLIS_COMMIT"
+            "ggml        : $env:GGML_COMMIT ($env:GGML_URL)"
+            "backend     : ${{ github.event.inputs.backend }}"
+            "configuration: ${{ github.event.inputs.configuration }}"
+            "webp        : ${{ github.event.inputs.trellis_webp }}"
+            "GGML_NATIVE : OFF"
+            "GGML_OPENMP : OFF"
+          )
+
+          if ('${{ github.event.inputs.backend }}' -eq 'cuda') {
+            $manifest += "cuda        : ${{ github.event.inputs.cuda_version }} (${{ github.event.inputs.cuda_architectures }})"
+          }
+
+          $manifest += ""
+          $manifest += "Artifact contents:"
+          $manifest += (Get-ChildItem $out -File | Sort-Object Name | ForEach-Object { $_.Name })
+          $manifest += "README.txt"
+
+          $manifest | Set-Content -Path (Join-Path $out "README.txt") -Encoding utf8
+          $manifest | ForEach-Object { Write-Host $_ }
+
+      - name: Smoke test packaged trellis-cli
+        shell: pwsh
+        run: |
+          # Runs from the packaged layout (exe + runtime DLLs side by side) so the
+          # test also proves the shipped CUDA runtime resolves. parse_args() sets
+          # help=true and main() then exits 0.
+          & "out/runtimes/win-x64/native/trellis-cli.exe" --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "trellis-cli.exe --help failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trellis-win-x64-${{ github.event.inputs.backend }}-${{ github.event.inputs.configuration }}
+          path: out/runtimes/win-x64/native/
+          if-no-files-found: error
