@@ -1,0 +1,98 @@
+// Copyright (c) SeasonEngine and contributors.
+// Licensed under the MIT License.
+// https://github.com/SeasonRealms/Season3D
+
+namespace Season.ThreeD;
+
+/// <summary>
+/// What one successful image-to-3D run produced. All paths are absolute; the side
+/// artifacts are only reported when the worker actually wrote them.
+/// </summary>
+public sealed class TrellisResult
+{
+    /// <summary>The requested GLB (<c>--output</c>).</summary>
+    public required string OutputPath { get; init; }
+
+    /// <summary>
+    /// <c>&lt;output&gt;_base.png</c>: the baked PBR atlas, written next to the GLB when
+    /// the texture path ran.
+    /// </summary>
+    public string? TexturePath { get; init; }
+
+    /// <summary>
+    /// <c>&lt;output&gt;.ply</c>: the full-resolution (pre-decimation) mesh with vertex
+    /// colours, always written by the worker.
+    /// </summary>
+    public string? PointCloudPath { get; init; }
+
+    /// <summary>
+    /// <c>&lt;output&gt;_cutout.png</c>: the background-removal matte, written when
+    /// <see cref="TrellisGenerationOptions.DumpBackgroundCutout"/> or
+    /// <see cref="TrellisGenerationOptions.BackgroundRemovalOnly"/> is set.
+    /// </summary>
+    public string? CutoutPath { get; init; }
+
+    /// <summary>
+    /// The seed the run actually used. Equals <see cref="TrellisGenerationOptions.Seed"/>
+    /// unless that was 0, in which case this is the random seed the worker picked - keep
+    /// it to reproduce the mesh.
+    /// </summary>
+    public uint Seed { get; init; }
+
+    /// <summary>Wall-clock time of the worker process.</summary>
+    public TimeSpan Duration { get; init; }
+
+    /// <summary>Worker exit code (0 for a completed run).</summary>
+    public int ExitCode { get; init; }
+
+    /// <summary>Captured stdout/stderr lines, in arrival order (capped).</summary>
+    public IReadOnlyList<string> Log { get; init; } = [];
+
+    internal static TrellisResult FromRun(TrellisGenerationOptions options, TrellisProcessOutcome outcome)
+    {
+        var output = Path.GetFullPath(options.OutputPath);
+        var directory = Path.GetDirectoryName(output) ?? string.Empty;
+        var stem = Path.Combine(directory, Path.GetFileNameWithoutExtension(output));
+
+        return new TrellisResult
+        {
+            OutputPath = output,
+            TexturePath = Existing(stem + "_base.png"),
+            // trellis-cli derives the side artifacts from the output path by truncating
+            // it at the last dot, so this is exactly <stem>.ply / <stem>_base.png.
+            PointCloudPath = Existing(stem + ".ply"),
+            CutoutPath = Existing(stem + "_cutout.png"),
+            Seed = outcome.Seed != 0 ? outcome.Seed : options.Seed,
+            Duration = outcome.Duration,
+            ExitCode = outcome.ExitCode,
+            Log = outcome.Log
+        };
+    }
+
+    private static string? Existing(string path) => File.Exists(path) ? path : null;
+}
+
+/// <summary>
+/// Identity of a trellis-cli build: enough for the UI to show "which worker am I
+/// running?" without a native version call (the CLI has no <c>--version</c>).
+/// </summary>
+public sealed class TrellisRuntimeInfo
+{
+    /// <summary>Resolved executable path.</summary>
+    public required string ExecutablePath { get; init; }
+
+    /// <summary>Win32/dylib file version, when the linker stamped one.</summary>
+    public string? FileVersion { get; init; }
+
+    /// <summary>Product version, when the linker stamped one.</summary>
+    public string? ProductVersion { get; init; }
+
+    /// <summary>Exit code of the <c>--help</c> probe (0 means the worker started).</summary>
+    public int ExitCode { get; init; }
+
+    /// <summary>Everything the worker printed for <c>--help</c> (usage goes to stderr).</summary>
+    public string HelpText { get; init; } = string.Empty;
+
+    /// <summary>Whether the probe completed with exit code 0.</summary>
+    public bool IsUsable => ExitCode == 0;
+}
