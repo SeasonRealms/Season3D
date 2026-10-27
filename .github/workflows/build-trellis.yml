@@ -9,11 +9,14 @@ name: build-trellis.yml
 # trellis.cpp and GGML commits are printed, written to the artifact manifest and
 # recorded in the job summary so a later run can be reproduced commit-for-commit.
 #
-# Season3D consumes the result as an isolated worker: GGML and trellis_core are
-# linked statically into trellis-cli.exe / trellis-server.exe, so nothing here
-# can collide with the shared ggml-*.dll that SeasonGGML ships for the other AI
-# libraries. Only the CUDA runtime DLLs are shipped alongside when the cuda
-# backend is selected.
+# Season3D consumes the result as an isolated worker process: trellis_core is
+# linked statically into trellis-cli.exe / trellis-server.exe, while ggml is
+# built as shared libraries (ggml.dll, ggml-base.dll, plus ggml-cpu.dll /
+# ggml-cuda.dll when the backend produces them). A worker process resolves its
+# imports from the directory of the loading .exe, so that whole DLL set ships in
+# the package next to the executables; a package without them dies inside the
+# loader with 0xC0000135 (STATUS_DLL_NOT_FOUND) before main() ever runs.
+# The CUDA runtime DLLs are shipped alongside when the cuda backend is selected.
 
 on:
   workflow_dispatch:
@@ -131,6 +134,17 @@ jobs:
             # dependency (mirrors upstream's Windows packaging).
             '-DGGML_NATIVE=OFF',
             '-DGGML_OPENMP=OFF',
+            # The build model is part of the packaging contract and is therefore
+            # pinned instead of left to the ggml default: BUILD_SHARED_LIBS=ON
+            # makes ggml produce DLLs, which trellis.cpp's CMakeLists.txt
+            # colocates with the executables (CMAKE_RUNTIME_OUTPUT_DIRECTORY) and
+            # which the Package step must ship. GGML_BACKEND_DL stays OFF because
+            # trellis.cpp walks ggml_backend_reg_count(): that registry only lists
+            # backends linked into the binary, so dynamic backend modules would be
+            # invisible to it - and their names would drift into
+            # ggml-cpu-<variant>.dll variants.
+            '-DBUILD_SHARED_LIBS=ON',
+            '-DGGML_BACKEND_DL=OFF',
             "-DTRELLIS_WEBP=${{ github.event.inputs.trellis_webp }}"
           )
 
@@ -161,6 +175,26 @@ jobs:
           Copy-Item trellis-src/LICENSE -Destination (Join-Path $out "trellis.txt") -Force
           Copy-Item trellis-src/thirdparty/ggml/LICENSE -Destination (Join-Path $out "ggml.txt") -Force
 
+          # ggml is a shared build, and Windows resolves imports only from the
+          # directory of the loading .exe, so the whole ggml runtime has to sit
+          # next to trellis-cli.exe / trellis-server.exe. Copy every ggml*.dll the
+          # build emitted (the set depends on the backend) and then fail loudly
+          # when a mandatory piece is absent, instead of shipping a package that
+          # cannot even start.
+          Get-ChildItem build -Recurse -File -Filter 'ggml*.dll' -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName $out -Force }
+
+          $requiredGgmlDlls = @('ggml.dll', 'ggml-base.dll')
+          if ('${{ github.event.inputs.backend }}' -eq 'cuda') {
+            $requiredGgmlDlls += 'ggml-cuda.dll'
+          }
+
+          foreach ($name in $requiredGgmlDlls) {
+            if (-not (Test-Path (Join-Path $out $name))) {
+              throw "Required GGML runtime is missing: $name (BUILD_SHARED_LIBS must stay ON)"
+            }
+          }
+
           if ('${{ github.event.inputs.backend }}' -eq 'cuda') {
             # The CUDA runtime is not part of the binary: ship cudart/cublas next
             # to the executables. CUDA 13 moved the Windows DLLs into bin/x64, so
@@ -185,6 +219,7 @@ jobs:
             "webp        : ${{ github.event.inputs.trellis_webp }}"
             "GGML_NATIVE : OFF"
             "GGML_OPENMP : OFF"
+            "ggml linkage: shared (BUILD_SHARED_LIBS=ON, GGML_BACKEND_DL=OFF, GGML_MAX_NAME=128)"
           )
 
           if ('${{ github.event.inputs.backend }}' -eq 'cuda') {
@@ -199,19 +234,76 @@ jobs:
           $manifest | Set-Content -Path (Join-Path $out "README.txt") -Encoding utf8
           $manifest | ForEach-Object { Write-Host $_ }
 
+      - name: Verify runtime dependencies
+        shell: pwsh
+        run: |
+          # A missing import kills the process inside the loader, before main()
+          # runs, and all the runner reports is a bare 0xC0000135. Resolve the
+          # import table here - with the MSVC env still active, so dumpbin is on
+          # PATH - and name the file instead of leaving a magic number in the log.
+          # This also guards the package itself: it checks the copied DLLs, not
+          # the ones the build tree happens to have available.
+          $out = "out/runtimes/win-x64/native"
+          $dump = (& dumpbin /nologo /dependents `
+              (Join-Path $out "trellis-cli.exe") `
+              (Join-Path $out "trellis-server.exe")) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed with exit code $LASTEXITCODE" }
+
+          Write-Host $dump
+          $dump | Set-Content -Path (Join-Path $out "dependencies.txt") -Encoding utf8
+          Add-Content -Path (Join-Path $out "README.txt") -Value "dependencies.txt" -Encoding utf8
+
+          $imported = [regex]::Matches($dump, '(?m)^\s+([A-Za-z0-9_.\-]+\.dll)\s*$') |
+            ForEach-Object { $_.Groups[1].Value } |
+            Sort-Object -Unique
+
+          # api-ms-win-* / ext-ms-* are API-set contracts, not files: the loader
+          # maps them through the API Set Schema (they end up in ucrtbase.dll and
+          # friends), so Test-Path can never find them. Counting them as missing
+          # would fail a perfectly healthy package.
+          $apiSets = $imported | Where-Object { $_ -match '^(api-ms-win|ext-ms)-' }
+          $files = $imported | Where-Object { $_ -notmatch '^(api-ms-win|ext-ms)-' }
+
+          $missing = @()
+          foreach ($dll in $files) {
+            if (-not (Test-Path (Join-Path $out $dll)) -and
+                -not (Test-Path (Join-Path $env:SystemRoot "System32\$dll"))) {
+              $missing += $dll
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            throw "Runtime dependencies are missing next to the executables: $($missing -join ', ')"
+          }
+
+          Write-Host "API-set imports (resolved by the loader): $($apiSets.Count)"
+          Write-Host "Resolved imports (package or System32): $($files -join ', ')"
+
       - name: Smoke test packaged trellis-cli
         shell: pwsh
         run: |
           # Runs from the packaged layout (exe + runtime DLLs side by side) so the
-          # test also proves the shipped CUDA runtime resolves. parse_args() sets
-          # help=true and main() then exits 0.
+          # test also proves the shipped ggml and CUDA runtimes resolve - the one
+          # thing a successful link cannot prove. parse_args() sets help=true and
+          # main() then exits 0.
           & "out/runtimes/win-x64/native/trellis-cli.exe" --help
           if ($LASTEXITCODE -ne 0) {
-            throw "trellis-cli.exe --help failed with exit code $LASTEXITCODE"
+            $code = $LASTEXITCODE
+            $hint = switch ($code) {
+              -1073741515 { '0xC0000135 STATUS_DLL_NOT_FOUND - a DLL named by the import table is not next to the exe' }
+              -1073741511 { '0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND - a DLL was found but does not export what the exe needs (ABI-mismatched ggml)' }
+              -1073741701 { '0xC000007B STATUS_INVALID_IMAGE_FORMAT - 32-bit/64-bit mix-up or a corrupted DLL' }
+              default      { 'no known mapping; see dependencies.txt in the artifact' }
+            }
+            throw "trellis-cli.exe --help failed with exit code $code ($hint)"
           }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
+        # Runs even when a step above fails: a failing package is exactly the one
+        # worth downloading (it reproduces 0xC0000135 locally in seconds), and a
+        # red run with no downloadable artifact helps nobody.
+        if: always()
         with:
           name: trellis-win-x64-${{ github.event.inputs.backend }}-${{ github.event.inputs.configuration }}
           path: out/runtimes/win-x64/native/
