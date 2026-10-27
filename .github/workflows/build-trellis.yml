@@ -8,14 +8,32 @@ name: build-trellis.yml
 # Freezing the build = passing a commit/tag in trellis_ref; the resolved
 # trellis.cpp and GGML commits are printed, written to the artifact manifest and
 # recorded in the job summary so a later run can be reproduced commit-for-commit.
+# An artifact is therefore the pair (trellis_ref, this repository's commit): the
+# one source file this repository contributes - the C ABI shim - is taken from
+# the checkout of the commit that triggered the run, and that commit is recorded
+# next to the trellis one.
 #
-# Season3D consumes the result as an isolated worker process: trellis_core is
-# linked statically into trellis-cli.exe / trellis-server.exe, while ggml is
-# built as shared libraries (ggml.dll, ggml-base.dll, plus ggml-cpu.dll /
-# ggml-cuda.dll when the backend produces them). A worker process resolves its
-# imports from the directory of the loading .exe, so that whole DLL set ships in
-# the package next to the executables; a package without them dies inside the
-# loader with 0xC0000135 (STATUS_DLL_NOT_FOUND) before main() ever runs.
+# Season3D ships two entry points into the same code, and the package carries
+# both:
+#
+#   trellis-cli.exe / trellis-server.exe - the worker lane. trellis_core is linked
+#     statically into them; ggml is built as shared libraries (ggml.dll,
+#     ggml-base.dll, plus ggml-cpu.dll / ggml-cuda.dll when the backend produces
+#     them). A worker resolves its imports from the directory of the loading
+#     .exe, so that whole DLL set ships in the package next to the executables; a
+#     package without them dies inside the loader with 0xC0000135
+#     (STATUS_DLL_NOT_FOUND) before main() ever runs.
+#
+#   trellis.dll - the thin C ABI lane. trellis.cpp exposes no C header and its
+#     core is STATIC, so this is our own single export: trellis_run_argv(), the
+#     same parse_args()+trellis_run() pair the cli runs, compiled by a target
+#     appended to trellis.cpp's own CMake project (see native/trellis_capi.cpp in
+#     this repository; native/apply-capi-lane.ps1 is the script that copies it in
+#     and appends the target, and a local build runs the same script). It is what
+#     lets Season3D present one library-shaped API on every platform - a dll here,
+#     .so/.dylib/.a elsewhere - while the worker stays available for crash
+#     isolation and hard timeouts.
+#
 # The CUDA runtime DLLs are shipped alongside when the cuda backend is selected.
 
 on:
@@ -90,22 +108,44 @@ jobs:
         shell: pwsh
         run: |
           $trellisCommit = (git -C trellis-src rev-parse HEAD).Trim()
+          # season3d-src is checked out further down, so it cannot be rev-parsed
+          # here; github.sha is exactly the commit that checkout resolves to.
+          $season3dCommit = '${{ github.sha }}'
           $ggmlUrl = (git -C trellis-src config -f .gitmodules --get submodule.thirdparty/ggml.url).Trim()
           $ggmlStatus = git -C trellis-src submodule status thirdparty/ggml
           # " f8697b3... thirdparty/ggml (heads/trellis)" -> SHA
           $ggmlCommit = (($ggmlStatus -replace '^\s*[+\-U]?', '') -split '\s+')[0]
 
           "TRELLIS_COMMIT=$trellisCommit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SEASON3D_COMMIT=$season3dCommit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "GGML_URL=$ggmlUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "GGML_COMMIT=$ggmlCommit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           @(
             "trellis.cpp: $trellisCommit"
+            "season3d:    $season3dCommit (C ABI shim)"
             "ggml:        $ggmlCommit ($ggmlUrl)"
           ) | ForEach-Object {
             Write-Host $_
             Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $_
           }
+
+      - name: Checkout Season3D (C ABI shim source)
+        uses: actions/checkout@v4
+        with:
+          # The shim lives in this repository; trellis-src above is the other
+          # checkout. Both have to exist before CMake runs.
+          path: season3d-src
+
+      - name: Add the C ABI lane to the trellis build
+        shell: pwsh
+        run: |
+          # The copy and the CMake append live in the repository rather than here,
+          # so a local build runs the very same step:
+          #   native/apply-capi-lane.ps1 -TrellisSource <path to a trellis.cpp checkout>
+          # See that script for why the lane has to be compiled by trellis.cpp's own
+          # CMake project and next to src/trellis_cli.cpp + src/trellis_args.cpp.
+          & season3d-src/native/apply-capi-lane.ps1 -TrellisSource trellis-src
 
       - name: Setup MSVC Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1
@@ -157,10 +197,12 @@ jobs:
           & cmake @cmakeArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Build trellis-cli and trellis-server
+      - name: Build trellis-cli, trellis-server and the C ABI lane
         shell: pwsh
         run: |
-          & cmake --build build --target trellis-cli trellis-server --parallel "${{ github.event.inputs.build_parallel }}"
+          # season_trellis is the dll target appended by the step above; it compiles
+          # trellis_capi.cpp plus the two sources trellis_run()/parse_args() live in.
+          & cmake --build build --target trellis-cli trellis-server season_trellis --parallel "${{ github.event.inputs.build_parallel }}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package
@@ -171,6 +213,16 @@ jobs:
 
           Copy-Item build/trellis-cli.exe $out -Force
           Copy-Item build/trellis-server.exe $out -Force
+
+          # The C ABI lane. Same trellis_core, same ggml, one exported entry; the
+          # name is fixed by OUTPUT_NAME trellis so consumers bind to "trellis" on
+          # every platform (trellis.dll / libtrellis.so / libtrellis.a).
+          $capiDll = Get-ChildItem build -Recurse -File -Filter 'trellis.dll' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $capiDll) {
+            throw "trellis.dll was not produced - the season_trellis target is missing from the build"
+          }
+          Copy-Item $capiDll.FullName $out -Force
 
           Copy-Item trellis-src/LICENSE -Destination (Join-Path $out "trellis.txt") -Force
           Copy-Item trellis-src/thirdparty/ggml/LICENSE -Destination (Join-Path $out "ggml.txt") -Force
@@ -213,6 +265,7 @@ jobs:
 
           $manifest = @(
             "trellis.cpp : $env:TRELLIS_COMMIT"
+            "season3d    : $env:SEASON3D_COMMIT (C ABI shim + apply-capi-lane.ps1)"
             "ggml        : $env:GGML_COMMIT ($env:GGML_URL)"
             "backend     : ${{ github.event.inputs.backend }}"
             "configuration: ${{ github.event.inputs.configuration }}"
@@ -220,6 +273,8 @@ jobs:
             "GGML_NATIVE : OFF"
             "GGML_OPENMP : OFF"
             "ggml linkage: shared (BUILD_SHARED_LIBS=ON, GGML_BACKEND_DL=OFF, GGML_MAX_NAME=128)"
+            "api lane    : thin C ABI - trellis.dll exports trellis_run_argv/trellis_api_version"
+            "              (parse_args+trellis_run, the same pair trellis-cli.exe runs)"
           )
 
           if ('${{ github.event.inputs.backend }}' -eq 'cuda') {
@@ -234,69 +289,158 @@ jobs:
           $manifest | Set-Content -Path (Join-Path $out "README.txt") -Encoding utf8
           $manifest | ForEach-Object { Write-Host $_ }
 
-      - name: Verify runtime dependencies
+      - name: Verify C ABI lane exports
         shell: pwsh
         run: |
-          # A missing import kills the process inside the loader, before main()
-          # runs, and all the runner reports is a bare 0xC0000135. Resolve the
-          # import table here - with the MSVC env still active, so dumpbin is on
-          # PATH - and name the file instead of leaving a magic number in the log.
-          # This also guards the package itself: it checks the copied DLLs, not
-          # the ones the build tree happens to have available.
-          $out = "out/runtimes/win-x64/native"
-          $dump = (& dumpbin /nologo /dependents `
-              (Join-Path $out "trellis-cli.exe") `
-              (Join-Path $out "trellis-server.exe")) -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed with exit code $LASTEXITCODE" }
+          # "The build succeeded" does not prove the dll is callable: a missing
+          # __declspec(dllexport) still yields a valid DLL with nothing to bind to,
+          # which only surfaces in a consumer as EntryPointNotFoundException. Read
+          # the export table with dumpbin instead of loading the image, so the check
+          # works on a runner that has no GPU driver to start the dll at all.
+          $dll = 'out/runtimes/win-x64/native/trellis.dll'
+          if (-not (Test-Path $dll)) { throw "trellis.dll is missing from the package" }
 
-          Write-Host $dump
-          $dump | Set-Content -Path (Join-Path $out "dependencies.txt") -Encoding utf8
-          Add-Content -Path (Join-Path $out "README.txt") -Value "dependencies.txt" -Encoding utf8
+          $exports = (& dumpbin /nologo /exports $dll 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin /exports failed on $dll" }
 
-          $imported = [regex]::Matches($dump, '(?m)^\s+([A-Za-z0-9_.\-]+\.dll)\s*$') |
-            ForEach-Object { $_.Groups[1].Value } |
-            Sort-Object -Unique
-
-          # api-ms-win-* / ext-ms-* are API-set contracts, not files: the loader
-          # maps them through the API Set Schema (they end up in ucrtbase.dll and
-          # friends), so Test-Path can never find them. Counting them as missing
-          # would fail a perfectly healthy package.
-          $apiSets = $imported | Where-Object { $_ -match '^(api-ms-win|ext-ms)-' }
-          $files = $imported | Where-Object { $_ -notmatch '^(api-ms-win|ext-ms)-' }
-
-          $missing = @()
-          foreach ($dll in $files) {
-            if (-not (Test-Path (Join-Path $out $dll)) -and
-                -not (Test-Path (Join-Path $env:SystemRoot "System32\$dll"))) {
-              $missing += $dll
+          # extern "C" keeps these unmangled, so plain name matching is enough.
+          foreach ($symbol in @('trellis_run_argv', 'trellis_api_version')) {
+            if ($exports -notmatch "\b$symbol\b") {
+              throw "trellis.dll does not export $symbol - the C ABI lane degraded to a plain dll"
             }
           }
 
-          if ($missing.Count -gt 0) {
-            throw "Runtime dependencies are missing next to the executables: $($missing -join ', ')"
+          $exports -split "`n" |
+            Where-Object { $_ -match 'trellis_run_argv|trellis_api_version' } |
+            ForEach-Object { Write-Host "export: $($_.Trim())" }
+
+      - name: Verify runtime dependencies
+        shell: pwsh
+        run: |
+          # 0xC0000135 is raised for a missing import at *any* depth, and the
+          # loader gives up before main(). A level-1 check therefore proves
+          # nothing: trellis-cli.exe only imports ggml.dll / cudart64_12.dll, while
+          # the dependency that actually broke the first run sat two levels down
+          # (ggml.dll -> ggml-cuda.dll -> nvcuda.dll). Walk the whole closure and
+          # classify every node:
+          #   package - shipped here, recurse into it
+          #   host    - System32 (OS, VC redist), i.e. the target machine has it
+          #   driver  - the NVIDIA driver API: not shippable, absent on a GPU-less
+          #             runner, so it cannot gate the build either
+          #   missing - would fail on every machine: fail the job
+          $out = "out/runtimes/win-x64/native"
+          $driverProvided = @('nvcuda.dll', 'nvcuda64.dll', 'nvml.dll', 'nvapi64.dll')
+
+          function Get-Imports {
+            param([string]$Path)
+            # 2>&1: GitHub's pwsh wrapper runs with $ErrorActionPreference=Stop,
+            # where a native stderr write would abort the step.
+            $dump = (& dumpbin /nologo /dependents $Path 2>&1) -join "`n"
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed on $Path" }
+            [regex]::Matches($dump, '(?m)^\s+([A-Za-z0-9_.\-]+\.dll)\s*$') |
+              ForEach-Object { $_.Groups[1].Value } |
+              # api-ms-win-* / ext-ms-* are API-set contracts, not files: the
+              # loader maps them through the API Set Schema onto ucrtbase.dll and
+              # friends, so Test-Path can never find them.
+              Where-Object { $_ -notmatch '^(api-ms-win|ext-ms)-' } |
+              Sort-Object -Unique
           }
 
-          Write-Host "API-set imports (resolved by the loader): $($apiSets.Count)"
-          Write-Host "Resolved imports (package or System32): $($files -join ', ')"
+          $resolved = @{}
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          # Both lanes, because they are separate images with their own import
+          # tables: the dll is loaded by an application process, so a dependency
+          # missing from its closure fails just as hard as for the exe.
+          foreach ($name in @('trellis-cli.exe', 'trellis-server.exe', 'trellis.dll')) {
+            $queue.Enqueue((Join-Path $out $name))
+          }
+
+          while ($queue.Count -gt 0) {
+            $binary = $queue.Dequeue()
+            foreach ($dll in (Get-Imports $binary)) {
+              if ($resolved.ContainsKey($dll)) { continue }
+              $packaged = Join-Path $out $dll
+              if (Test-Path $packaged) {
+                $resolved[$dll] = 'package'
+                $queue.Enqueue($packaged)
+              }
+              elseif (Test-Path (Join-Path $env:SystemRoot "System32\$dll")) {
+                $resolved[$dll] = 'host'
+              }
+              elseif ($driverProvided -contains $dll.ToLowerInvariant()) {
+                $resolved[$dll] = 'driver'
+              }
+              else {
+                $resolved[$dll] = 'missing'
+              }
+            }
+          }
+
+          $report = $resolved.Keys | Sort-Object { $resolved[$_] }, { $_ } |
+            ForEach-Object { '{0,-28} {1}' -f $_, $resolved[$_] }
+          $report | Set-Content -Path (Join-Path $out "dependencies.txt") -Encoding utf8
+          Add-Content -Path (Join-Path $out "README.txt") -Value "dependencies.txt" -Encoding utf8
+          $report | ForEach-Object { Write-Host $_ }
+
+          $missing = @($resolved.Keys | Where-Object { $resolved[$_] -eq 'missing' } | Sort-Object)
+          $driverless = @($resolved.Keys | Where-Object { $resolved[$_] -eq 'driver' } | Sort-Object)
+          Write-Host ("import closure: {0} DLLs - package {1}, host {2}, driver-only {3}, missing {4}" -f (
+            $resolved.Count),
+            @($resolved.Keys | Where-Object { $resolved[$_] -eq 'package' }).Count,
+            @($resolved.Keys | Where-Object { $resolved[$_] -eq 'host' }).Count,
+            $driverless.Count,
+            $missing.Count)
+
+          if ($missing.Count -gt 0) {
+            throw "Runtime dependencies missing from the package: $($missing -join ', ')"
+          }
+          if ($driverless.Count -gt 0) {
+            Write-Host "Host-only dependencies, provided by the target machine's GPU driver: $($driverless -join ', ')"
+          }
 
       - name: Smoke test packaged trellis-cli
         shell: pwsh
         run: |
-          # Runs from the packaged layout (exe + runtime DLLs side by side) so the
-          # test also proves the shipped ggml and CUDA runtimes resolve - the one
-          # thing a successful link cannot prove. parse_args() sets help=true and
-          # main() then exits 0.
-          & "out/runtimes/win-x64/native/trellis-cli.exe" --help
-          if ($LASTEXITCODE -ne 0) {
-            $code = $LASTEXITCODE
+          # The cuda build imports nvcuda.dll through ggml-cuda.dll, so the process
+          # cannot even be created on a host without an NVIDIA driver - which is
+          # every GitHub-hosted Windows runner. That is a property of the host, not
+          # of the package, and nothing can be bundled to fix it, so the dynamic
+          # check is conditional. The import closure above is what gates the
+          # artifact on CI; this step proves the packaged layout loads for real
+          # whenever a driver exists (self-hosted runner, developer machine).
+          if ('${{ github.event.inputs.backend }}' -eq 'cuda' -and
+              -not (Test-Path (Join-Path $env:SystemRoot "System32\nvcuda.dll"))) {
+            $msg = "Dynamic smoke test skipped: this runner has no NVIDIA driver (System32/nvcuda.dll is absent) and a cuda build cannot be loaded without one. The import closure check passed; run trellis-cli.exe --help on a machine with a driver."
+            Write-Host "::warning::$msg"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- $msg" -Encoding utf8
+            return
+          }
+
+          # --help prints its usage to stderr, and GitHub's pwsh wrapper enables
+          # $ErrorActionPreference=Stop, which turns a native stderr write into a
+          # terminating error. Merge the streams and judge the process by its exit
+          # code alone.
+          $ErrorActionPreference = 'Continue'
+          $usage = & "out/runtimes/win-x64/native/trellis-cli.exe" --help 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $usage
+
+          if ($code -ne 0) {
             $hint = switch ($code) {
-              -1073741515 { '0xC0000135 STATUS_DLL_NOT_FOUND - a DLL named by the import table is not next to the exe' }
+              -1073741515 { '0xC0000135 STATUS_DLL_NOT_FOUND - a DLL in the import closure is missing' }
               -1073741511 { '0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND - a DLL was found but does not export what the exe needs (ABI-mismatched ggml)' }
-              -1073741701 { '0xC000007B STATUS_INVALID_IMAGE_FORMAT - 32-bit/64-bit mix-up or a corrupted DLL' }
+              -1073741701 { '0xC000007B STATUS_INVALID_IMAGE_FORMAT - 32/64-bit mix-up or a corrupted DLL' }
               default      { 'no known mapping; see dependencies.txt in the artifact' }
             }
             throw "trellis-cli.exe --help failed with exit code $code ($hint)"
           }
+
+          Write-Host 'trellis-cli.exe --help exited 0: the packaged layout loads.'
+
+          # trellis.dll imports the same closure as this exe (trellis_core is
+          # static in both), so a layout that starts the exe starts the dll too.
+          # Its export table is asserted in 'Verify C ABI lane exports' rather than
+          # by loading it here, because loading it would need the same GPU driver.
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
