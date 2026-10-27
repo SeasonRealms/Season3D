@@ -1,28 +1,37 @@
 name: build-trellis.yml
 
-# Builds SeasonRealms/trellis.cpp for Windows x64 with the GGML revision that the
-# fork itself pins in thirdparty/ggml (.gitmodules -> pwilkin/ggml, branch
-# "trellis"). The submodule commit recorded in the trellis.cpp tree is the
-# version pin: this workflow never re-points or patches it, so the GGML ABI in
-# the produced binaries is exactly the one trellis.cpp is developed against.
-# Freezing the build = passing a commit/tag in trellis_ref; the resolved
-# trellis.cpp and GGML commits are printed, written to the artifact manifest and
-# recorded in the job summary so a later run can be reproduced commit-for-commit.
-# An artifact is therefore the pair (trellis_ref, this repository's commit): the
-# one source file this repository contributes - the C ABI shim - is taken from
-# the checkout of the commit that triggered the run, and that commit is recorded
-# next to the trellis one.
+# Builds SeasonRealms/trellis.cpp for Windows x64 against SeasonRealms/ggml, the
+# same ggml the rest of the product ships (SeasonGGML builds it from the same
+# repository). trellis.cpp still declares pwilkin/ggml as its submodule, so that
+# checkout is deliberately not used: the submodule is left out and a
+# SeasonRealms/ggml tree is vendored into thirdparty/ggml instead, which is the
+# path trellis.cpp's own CMakeLists.txt consumes (GGML_DIR +
+# add_subdirectory(thirdparty/ggml)). The commit trellis.cpp pins in its gitlink
+# is still read out and printed next to the one actually built, so drift between
+# the two lineages shows up in the job summary instead of going unnoticed.
+# Freezing the build = passing a commit/tag in trellis_ref - and, when the ggml
+# side has to be pinned as well, in ggml_ref; both resolved commits are printed,
+# written to the artifact manifest and recorded in the job summary so a later
+# run can be reproduced commit-for-commit.
+# An artifact is therefore the triple (trellis_ref, ggml_ref, this repository's
+# commit): the one source file this repository contributes - the C ABI shim - is
+# taken from the checkout of the commit that triggered the run, and that commit
+# is recorded next to the trellis and ggml ones.
 #
-# Season3D ships two entry points into the same code, and the package carries
+# SeasonThreeD ships two entry points into the same code, and the package carries
 # both:
 #
 #   trellis-cli.exe / trellis-server.exe - the worker lane. trellis_core is linked
-#     statically into them; ggml is built as shared libraries (ggml.dll,
-#     ggml-base.dll, plus ggml-cpu.dll / ggml-cuda.dll when the backend produces
-#     them). A worker resolves its imports from the directory of the loading
-#     .exe, so that whole DLL set ships in the package next to the executables; a
-#     package without them dies inside the loader with 0xC0000135
-#     (STATUS_DLL_NOT_FOUND) before main() ever runs.
+#     statically into them, but the ggml they run on is NOT packaged here: ggml is
+#     built with GGML_BACKEND_DL=ON (the model SeasonGGML publishes), so the runtime
+#     is ggml.dll + ggml-base.dll plus backend modules, and at run time trellis
+#     discovers whatever sits next to the loading .exe. In a SeasonStudio output
+#     folder that is SeasonGGML's ggml-cpu-<variant>.dll / ggml-cuda.dll, and
+#     cudacudnn-runtime's cudart64_12 / cublas / cublasLt - one copy for trellis,
+#     llm, sd, tts and stt alike. Shipping a second, differently configured ggml.dll
+#     here would not just duplicate 135 MB: the loader keeps the first copy it finds,
+#     so the other half of the product would silently run against an ABI it was not
+#     built for (NETSDK1152 is that collision, one step earlier).
 #
 #   trellis.dll - the thin C ABI lane. trellis.cpp exposes no C header and its
 #     core is STATIC, so this is our own single export: trellis_run_argv(), the
@@ -30,11 +39,63 @@ name: build-trellis.yml
 #     appended to trellis.cpp's own CMake project (see native/trellis_capi.cpp in
 #     this repository; native/apply-capi-lane.ps1 is the script that copies it in
 #     and appends the target, and a local build runs the same script). It is what
-#     lets Season3D present one library-shaped API on every platform - a dll here,
+#     lets SeasonThreeD present one library-shaped API on every platform - a dll here,
 #     .so/.dylib/.a elsewhere - while the worker stays available for crash
 #     isolation and hard timeouts.
 #
-# The CUDA runtime DLLs are shipped alongside when the cuda backend is selected.
+# Two pins are part of that contract and have to match the rest of the product:
+#
+#   ggml_ref       - must be the commit SeasonGGML was built from. ggml.dll,
+#                    ggml-base.dll and the backend modules all pass ggml_tensor and
+#                    the backend vtables across the boundary, so a revision skew
+#                    surfaces as STATUS_ENTRYPOINT_NOT_FOUND or as silent corruption.
+#                    It defaults to SeasonRealms/ggml's `season-0.27.0-trellis1` tag:
+#                    ggml-org/ggml 0.27.0 plus the four patches trellis.cpp's results
+#                    depend on (fastdiv UB above 2^31, GGML_PREC_F32 honoured in the
+#                    TILE / VEC / MMA FlashAttention kernels, and the GGML_FA_DEBUG
+#                    dispatch line). Plain upstream 0.27 compiles and links, then
+#                    returns a different latent: res-1024 dense scenes take a GPU page
+#                    fault in fastdiv and the FA bias goes 13x (NVIDIA MMA) or ~120
+#                    sigma (AMD TILE) out. Never point this at a bare mirror again -
+#                    SeasonGGML must build from the very same tag.
+#   cuda_version   - must be the toolkit cudacudnn-runtime ships (12.8.1): both
+#                    ggml-cuda.dll and trellis's own kernels (deform_conv,
+#                    decimate_qem) link cudart64_12.dll.
+#
+# The artifact is therefore (trellis_ref, ggml_ref, cuda_version, this repository's
+# commit) - all four are printed into the summary and the manifest.
+#
+# The worker lane ships TWICE, because trellis's two custom GPU kernels (BiRefNet's
+# deformable conv and the QEM decimator) are compiled against exactly one GPU API:
+#
+#   trellis-cli.exe / trellis-server.exe        - the CUDA lane (GGML_CUDA=ON); the
+#     fastest one on NVIDIA, where both kernels are native CUDA against the cudart
+#     cudacudnn-runtime already provides. src/trellis_model.cpp refuses every device
+#     whose registry name is not "CUDA" here, because the CPU deform_conv fallback is
+#     minutes per run.
+#   trellis-cli-vulkan.exe / trellis-server-vulkan.exe
+#                                               - the Vulkan lane (GGML_VULKAN=ON, no
+#     CUDA at all); both kernels are SPIR-V compute shaders, so one binary covers
+#     NVIDIA, AMD and Intel through ggml-vulkan.dll and still falls back to
+#     ggml-cpu-<variant>.dll when no Vulkan device is usable. Configured with the
+#     Vulkan SDK's glslc when the runner has one; otherwise the lane is built without
+#     ggml-vulkan and keeps the CPU deform fallback.
+#   trellis.dll / trellis-vulkan.dll            - the same two lanes as C ABI dlls.
+#
+# Splitting by lane instead of by vendor is deliberate: a CUDA build links cudart64_12
+# into its own kernels and never compiles the Vulkan shaders, so one binary cannot do
+# both - it would either drag cudart onto AMD/Intel machines or leave deform_conv on the
+# CPU. The managed lane picks the worker per machine (TrellisWorker.Auto: nvcuda.dll
+# present -> CUDA worker, else Vulkan worker) and both are addressable explicitly.
+#
+# One consequence worth knowing when reading a run: SeasonGGML ships ggml-cuda.dll and
+# ggml-vulkan.dll in the same folder, so a Vulkan worker left to itself would pick the
+# CUDA device on an NVIDIA machine - right for ggml, wrong for trellis, whose kernels in
+# that build are SPIR-V. SeasonThreeD therefore passes --backend Vulkan for that lane and
+# retries once on --backend CPU when the backend will not initialize, which is what keeps
+# the CPU fallback the worker would otherwise do on its own. Neither lane relies on
+# anything from this workflow beyond the two files being named as they are.
+
 
 on:
   workflow_dispatch:
@@ -51,20 +112,25 @@ on:
         description: "SeasonRealms/trellis.cpp tag / branch / commit (a commit or tag freezes the build)"
         required: true
         default: "main"
-      backend:
-        description: "GGML backend compiled into trellis"
+      ggml_ref:
+        description: "SeasonRealms/ggml tag / branch / commit (a commit or tag freezes the ggml side; must equal SeasonGGML's build)"
+        required: true
+        default: "season-0.27.0-trellis1"
+      vulkan_kernels:
+        description: "Vulkan lane: compile the SPIR-V deform_conv/decimate kernels (needs the Vulkan SDK's glslc)"
         required: true
         type: choice
-        default: "cuda"
+        default: "auto"
         options:
-          - cuda
-          - cpu
+          - auto
+          - "on"
+          - "off"
       cuda_version:
-        description: "CUDA Toolkit version (cuda backend only), aligned with SeasonGGML / SeasonTTS"
+        description: "CUDA Toolkit version (CUDA lane), aligned with SeasonGGML / SeasonTTS"
         required: false
         default: "12.8.1"
       cuda_architectures:
-        description: "CUDA architectures (cuda backend only; 89-real covers the RTX 4090)"
+        description: "CUDA architectures (CUDA lane only; 89-real covers the RTX 4090)"
         required: false
         default: "75-virtual;80-real;86-real;89-real;90-virtual"
       trellis_webp:
@@ -85,6 +151,7 @@ permissions:
 
 env:
   TRELLIS_REPO: SeasonRealms/trellis.cpp
+  GGML_REPO: SeasonRealms/ggml
 
 jobs:
   build-windows-x64:
@@ -100,42 +167,110 @@ jobs:
           repository: ${{ env.TRELLIS_REPO }}
           ref: ${{ github.event.inputs.trellis_ref }}
           path: trellis-src
-          # Recursive: thirdparty/ggml is checked out at the commit pinned by the
-          # trellis.cpp tree itself, which is the GGML version this build ships.
-          submodules: recursive
+          # No submodules on purpose. thirdparty/ggml is trellis.cpp's only
+          # submodule and it points at pwilkin/ggml; the ggml tree this build
+          # actually compiles is SeasonRealms/ggml, vendored into that exact path
+          # by the next two steps. Downloading the other lineage first would only
+          # cost minutes and then be deleted.
+          submodules: false
+
+      - name: Checkout ${{ env.GGML_REPO }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GGML_REPO }}
+          ref: ${{ github.event.inputs.ggml_ref }}
+          # Sibling of trellis-src, not nested inside it: the tree is copied over
+          # thirdparty/ggml below, and a nested checkout would leave a second
+          # repository inside a submodule path.
+          path: ggml-src
+          # ggml carries no submodules, so this is a no-op today and stays false
+          # to keep the checkout cheap.
+          submodules: false
+
+      - name: Vendor ${{ env.GGML_REPO }} into thirdparty/ggml
+        shell: pwsh
+        run: |
+          # trellis.cpp hardcodes the ggml path:
+          #   set(GGML_DIR ${CMAKE_SOURCE_DIR}/thirdparty/ggml)
+          #   add_subdirectory(thirdparty/ggml)
+          # There is no cache variable to redirect it, so swapping the source
+          # means materialising the tree at that path - exactly what a submodule
+          # checkout would have produced, minus the pwilkin/ggml commit.
+          $dst = 'trellis-src/thirdparty/ggml'
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          # .git is checkout metadata, nothing else is: dotfiles (.gitignore,
+          # .clang-format, CMake's own manifests) belong to the tree.
+          Get-ChildItem -LiteralPath 'ggml-src' -Force |
+            Where-Object { $_.Name -ne '.git' } |
+            ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $dst -Recurse -Force }
+
+          # Fail here rather than inside CMake's add_subdirectory: a wrong ref or
+          # an empty tree otherwise surfaces as an unrelated configure error.
+          foreach ($required in @('CMakeLists.txt', 'include/ggml.h', 'include/ggml-backend.h', 'LICENSE')) {
+            if (-not (Test-Path (Join-Path $dst $required))) {
+              throw "$env:GGML_REPO@${{ github.event.inputs.ggml_ref }} has no $required - that checkout is not a ggml tree"
+            }
+          }
+
+          # The vendored tree no longer matches the gitlink trellis.cpp records,
+          # so git would report thirdparty/ggml as modified and trellis.cpp's
+          # CMakeLists.txt would stamp TRELLIS_GIT_DIRTY=1 into every binary.
+          # The substitution is intended, so hide it from status instead of
+          # shipping "-dirty" builds.
+          git -C trellis-src config submodule.thirdparty/ggml.ignore all
+          if ($LASTEXITCODE -ne 0) { throw "could not suppress submodule dirtiness in trellis-src" }
+
+          Write-Host "Vendored $env:GGML_REPO@${{ github.event.inputs.ggml_ref }} into $dst"
 
       - name: Record pinned revisions
         shell: pwsh
+        env:
+          GGML_REF: ${{ github.event.inputs.ggml_ref }}
         run: |
           $trellisCommit = (git -C trellis-src rev-parse HEAD).Trim()
-          # season3d-src is checked out further down, so it cannot be rev-parsed
+          # seasonthreed-src is checked out further down, so it cannot be rev-parsed
           # here; github.sha is exactly the commit that checkout resolves to.
-          $season3dCommit = '${{ github.sha }}'
-          $ggmlUrl = (git -C trellis-src config -f .gitmodules --get submodule.thirdparty/ggml.url).Trim()
-          $ggmlStatus = git -C trellis-src submodule status thirdparty/ggml
-          # " f8697b3... thirdparty/ggml (heads/trellis)" -> SHA
-          $ggmlCommit = (($ggmlStatus -replace '^\s*[+\-U]?', '') -split '\s+')[0]
+          $seasonthreedCommit = '${{ github.sha }}'
+          # The tree that was vendored above, not the commit trellis.cpp records:
+          # the two lineages have diverged, so both are reported.
+          $ggmlCommit = (git -C ggml-src rev-parse HEAD).Trim()
+          $ggmlPinned = ((git -C trellis-src ls-tree HEAD thirdparty/ggml) -split '\s+')[2]
+          $ggmlUrl = "https://github.com/$env:GGML_REPO"
 
           "TRELLIS_COMMIT=$trellisCommit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "SEASON3D_COMMIT=$season3dCommit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SEASONTHREED_COMMIT=$seasonthreedCommit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "GGML_URL=$ggmlUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "GGML_COMMIT=$ggmlCommit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "GGML_REF=$env:GGML_REF" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "GGML_PINNED=$ggmlPinned" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           @(
-            "trellis.cpp: $trellisCommit"
-            "season3d:    $season3dCommit (C ABI shim)"
-            "ggml:        $ggmlCommit ($ggmlUrl)"
+            "trellis.cpp  : $trellisCommit"
+            "SeasonThreeD : $seasonthreedCommit (C ABI shim)"
+            "ggml         : $ggmlCommit ($ggmlUrl @ $env:GGML_REF)"
           ) | ForEach-Object {
             Write-Host $_
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $_
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $_ -Encoding utf8
           }
 
-      - name: Checkout Season3D (C ABI shim source)
+          # Expected most of the time (SeasonRealms/ggml tracks pwilkin master,
+          # trellis.cpp pins pwilkin's "trellis" branch), but never silent: the
+          # CUDA fixes that live only on that branch are lost when the commits
+          # differ, which is a behaviour change worth seeing in the run log.
+          if ($ggmlPinned -ne $ggmlCommit) {
+            $note = "ggml built here ($ggmlCommit) is not the commit trellis.cpp pins ($ggmlPinned); see the assessment of branch-only patches before shipping."
+            Write-Host "::warning::$note"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- $note" -Encoding utf8
+          }
+
+      - name: Checkout SeasonThreeD (C ABI shim source)
         uses: actions/checkout@v4
         with:
           # The shim lives in this repository; trellis-src above is the other
           # checkout. Both have to exist before CMake runs.
-          path: season3d-src
+          path: seasonthreed-src
 
       - name: Add the C ABI lane to the trellis build
         shell: pwsh
@@ -145,7 +280,7 @@ jobs:
           #   native/apply-capi-lane.ps1 -TrellisSource <path to a trellis.cpp checkout>
           # See that script for why the lane has to be compiled by trellis.cpp's own
           # CMake project and next to src/trellis_cli.cpp + src/trellis_args.cpp.
-          & season3d-src/native/apply-capi-lane.ps1 -TrellisSource trellis-src
+          & seasonthreed-src/native/apply-capi-lane.ps1 -TrellisSource trellis-src
 
       - name: Setup MSVC Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1
@@ -156,17 +291,52 @@ jobs:
         uses: seanmiddleditch/gha-setup-ninja@v5
 
       - name: Install CUDA Toolkit
-        if: github.event.inputs.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: "${{ github.event.inputs.cuda_version }}"
 
-      - name: Configure CMake
+      - name: Detect the Vulkan SDK
+        id: vulkan
         shell: pwsh
         run: |
-          $cmakeArgs = @(
+          # The Vulkan lane builds deform_conv.comp and decimate_qem.comp into SPIR-V
+          # with glslc, which only ships in the Vulkan SDK. "auto" means: use it when
+          # this runner has it; without it the lane still builds and runs, only with
+          # the CPU implementations of both kernels - correct, but minutes per run.
+          $choice = '${{ github.event.inputs.vulkan_kernels }}'
+          $glslc = Get-Command glslc -ErrorAction SilentlyContinue
+          $enable = switch ($choice) {
+            'on'   { if (-not $glslc) { throw "vulkan_kernels=on, but glslc is not on PATH - install the Vulkan SDK on this runner" }; $true }
+            'off'  { $false }
+            default { [bool]$glslc }
+          }
+
+          # FindVulkan() keys off VULKAN_SDK, and a runner that only has glslc on PATH
+          # (e.g. picked up from a driver bundle) would otherwise fail the configure.
+          if ($enable -and -not $env:VULKAN_SDK -and $glslc) {
+            $sdk = Split-Path (Split-Path $glslc.Source -Parent) -Parent   # <sdk>/Bin/glslc.exe
+            $env:VULKAN_SDK = $sdk
+            Write-Host "VULKAN_SDK derived from glslc: $sdk"
+            "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+          Write-Host "vulkan_kernels=$choice glslc=$([bool]$glslc) -> ggml-vulkan=$enable"
+          "enabled=$($enable.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Configure CMake (CUDA lane + Vulkan lane)
+        shell: pwsh
+        run: |
+          # One source tree, two configurations - one per shipped worker:
+          #
+          #   build-cuda   -> trellis-cli.exe / trellis-server.exe / trellis.dll
+          #                   (GGML_CUDA=ON: deform_conv + decimate are CUDA kernels)
+          #   build-vulkan -> trellis-cli-vulkan.exe / trellis-server-vulkan.exe /
+          #                   trellis-vulkan.dll (no CUDA; both kernels as SPIR-V when
+          #                   ggml-vulkan is on, CPU fallback otherwise)
+          #
+          # Everything else is shared, so it is spelled once.
+          $common = @(
             '-S', 'trellis-src',
-            '-B', 'build',
             '-G', 'Ninja',
             "-DCMAKE_BUILD_TYPE=${{ github.event.inputs.configuration }}",
             # GGML_NATIVE=OFF keeps the CPU path off the runner's own ISA so the
@@ -175,35 +345,55 @@ jobs:
             '-DGGML_NATIVE=OFF',
             '-DGGML_OPENMP=OFF',
             # The build model is part of the packaging contract and is therefore
-            # pinned instead of left to the ggml default: BUILD_SHARED_LIBS=ON
-            # makes ggml produce DLLs, which trellis.cpp's CMakeLists.txt
-            # colocates with the executables (CMAKE_RUNTIME_OUTPUT_DIRECTORY) and
-            # which the Package step must ship. GGML_BACKEND_DL stays OFF because
-            # trellis.cpp walks ggml_backend_reg_count(): that registry only lists
-            # backends linked into the binary, so dynamic backend modules would be
-            # invisible to it - and their names would drift into
-            # ggml-cpu-<variant>.dll variants.
+            # pinned instead of left to the ggml default:
+            #   BUILD_SHARED_LIBS=ON - ggml is a DLL, not a static archive.
+            #   GGML_BACKEND_DL=ON   - every backend is a module that ggml.dll loads at
+            #     run time, exactly as SeasonGGML builds it. trellis.cpp reaches them
+            #     through the registry API only (ggml_backend_load_all +
+            #     ggml_backend_dev_by_type / dev_init), so it links nothing but
+            #     ggml + ggml-base - which is what lets both packages run on ONE ggml
+            #     runtime instead of shipping two.
+            # The backend modules are still compiled (ggml's CMake makes ggml depend on
+            # them), but Package deliberately ships no ggml dll and no cudart/cublas:
+            # the artifact is the workers plus the two lane dlls.
             '-DBUILD_SHARED_LIBS=ON',
-            '-DGGML_BACKEND_DL=OFF',
+            '-DGGML_BACKEND_DL=ON',
             "-DTRELLIS_WEBP=${{ github.event.inputs.trellis_webp }}"
           )
 
-          if ('${{ github.event.inputs.backend }}' -eq 'cuda') {
-            $cmakeArgs += '-DGGML_CUDA=ON'
-            $cmakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=${{ github.event.inputs.cuda_architectures }}"
-          }
-
-          Write-Host "Running: cmake $($cmakeArgs -join ' ')"
-          & cmake @cmakeArgs
+          $cudaArgs = $common + @(
+            '-B', 'build-cuda',
+            '-DGGML_CUDA=ON',
+            "-DCMAKE_CUDA_ARCHITECTURES=${{ github.event.inputs.cuda_architectures }}"
+          )
+          Write-Host "Running: cmake $($cudaArgs -join ' ')"
+          & cmake @cudaArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Build trellis-cli, trellis-server and the C ABI lane
+          $vulkanArgs = $common + @('-B', 'build-vulkan')
+          if ('${{ steps.vulkan.outputs.enabled }}' -eq 'true') {
+            # TARGET ggml-vulkan then exists, which is what makes trellis.cpp compile
+            # deform_conv_vk.cpp / decimate_qem_vk.cpp instead of the CPU fallbacks.
+            $vulkanArgs += '-DGGML_VULKAN=ON'
+          }
+          Write-Host "Running: cmake $($vulkanArgs -join ' ')"
+          & cmake @vulkanArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build both lanes
         shell: pwsh
         run: |
-          # season_trellis is the dll target appended by the step above; it compiles
-          # trellis_capi.cpp plus the two sources trellis_run()/parse_args() live in.
-          & cmake --build build --target trellis-cli trellis-server season_trellis --parallel "${{ github.event.inputs.build_parallel }}"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # season_trellis is the dll target appended by 'Add the C ABI lane'; it
+          # compiles trellis_capi.cpp plus the two sources trellis_run()/parse_args()
+          # live in. trellis-devices is not packaged: it only enumerates ggml's
+          # registry, which is how the verification step proves the DL backend modules
+          # were discovered - once per lane, because the lanes link different kernels.
+          foreach ($lane in @('cuda', 'vulkan')) {
+            Write-Host "=== build-$lane ==="
+            & cmake --build "build-$lane" --target trellis-cli trellis-server trellis-devices season_trellis --parallel "${{ github.event.inputs.build_parallel }}"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
 
       - name: Package
         shell: pwsh
@@ -211,75 +401,74 @@ jobs:
           $out = "out/runtimes/win-x64/native"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
 
-          Copy-Item build/trellis-cli.exe $out -Force
-          Copy-Item build/trellis-server.exe $out -Force
+          # Two lanes, two names, one package. The CUDA lane keeps the plain names so a
+          # caller that just asks for "trellis-cli" gets what it always got; the Vulkan
+          # lane says so in its file names, because that is the copy an AMD or Intel
+          # machine - or any machine without a usable CUDA device - is meant to run.
+          function Copy-LaneFile {
+            param([string]$Lane, [string]$Name, [string]$As)
+            $src = Get-ChildItem "build-$Lane" -Recurse -File -Filter $Name -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $src) { throw "build-$Lane produced no $Name" }
+            Copy-Item $src.FullName (Join-Path $out $As) -Force
+            Write-Host "packaged build-$Lane/$Name -> $As"
+          }
 
           # The C ABI lane. Same trellis_core, same ggml, one exported entry; the
           # name is fixed by OUTPUT_NAME trellis so consumers bind to "trellis" on
-          # every platform (trellis.dll / libtrellis.so / libtrellis.a).
-          $capiDll = Get-ChildItem build -Recurse -File -Filter 'trellis.dll' -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $capiDll) {
-            throw "trellis.dll was not produced - the season_trellis target is missing from the build"
-          }
-          Copy-Item $capiDll.FullName $out -Force
+          # every platform (trellis.dll / libtrellis.so / libtrellis.a). The CUDA copy
+          # imports cudart64_12 and is therefore only loadable where cudacudnn-runtime
+          # is staged; trellis-vulkan.dll is the portable one, and both expose
+          # trellis_run_argv so the choice is a file name, not an ABI.
+          Copy-LaneFile cuda   'trellis-cli.exe'           'trellis-cli.exe'
+          Copy-LaneFile cuda   'trellis-server.exe'        'trellis-server.exe'
+          Copy-LaneFile cuda   'trellis.dll'               'trellis.dll'
+          Copy-LaneFile vulkan 'trellis-cli.exe'           'trellis-cli-vulkan.exe'
+          Copy-LaneFile vulkan 'trellis-server.exe'        'trellis-server-vulkan.exe'
+          Copy-LaneFile vulkan 'trellis.dll'               'trellis-vulkan.dll'
 
           Copy-Item trellis-src/LICENSE -Destination (Join-Path $out "trellis.txt") -Force
           Copy-Item trellis-src/thirdparty/ggml/LICENSE -Destination (Join-Path $out "ggml.txt") -Force
 
-          # ggml is a shared build, and Windows resolves imports only from the
-          # directory of the loading .exe, so the whole ggml runtime has to sit
-          # next to trellis-cli.exe / trellis-server.exe. Copy every ggml*.dll the
-          # build emitted (the set depends on the backend) and then fail loudly
-          # when a mandatory piece is absent, instead of shipping a package that
-          # cannot even start.
-          Get-ChildItem build -Recurse -File -Filter 'ggml*.dll' -ErrorAction SilentlyContinue |
-            ForEach-Object { Copy-Item $_.FullName $out -Force }
-
-          $requiredGgmlDlls = @('ggml.dll', 'ggml-base.dll')
-          if ('${{ github.event.inputs.backend }}' -eq 'cuda') {
-            $requiredGgmlDlls += 'ggml-cuda.dll'
-          }
-
-          foreach ($name in $requiredGgmlDlls) {
-            if (-not (Test-Path (Join-Path $out $name))) {
-              throw "Required GGML runtime is missing: $name (BUILD_SHARED_LIBS must stay ON)"
-            }
-          }
-
-          if ('${{ github.event.inputs.backend }}' -eq 'cuda') {
-            # The CUDA runtime is not part of the binary: ship cudart/cublas next
-            # to the executables. CUDA 13 moved the Windows DLLs into bin/x64, so
-            # search the toolkit recursively and fail loudly when a DLL is absent.
-            $cudaRoot = $env:CUDA_PATH
-            if (-not $cudaRoot) { throw "CUDA_PATH is not set" }
-
-            foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
-              $dll = Get-ChildItem -Path $cudaRoot -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-              if (-not $dll) { throw "$pattern not found under $cudaRoot" }
-              Write-Host "Bundling $($dll.Name)"
-              Copy-Item $dll.FullName $out -Force
-            }
+          # No ggml and no cudart/cublas in this package. Both are shared with the rest
+          # of the product - SeasonGGML's ggml.dll + ggml-base.dll + backend modules,
+          # cudacudnn-runtime's cudart / cublas / cublasLt - and a second copy in the
+          # same output directory is the one thing that cannot work: the loader binds
+          # the first ggml.dll it finds, so whichever package lost the race would run
+          # against an ABI it was never compiled for. The 'Verify runtime dependencies'
+          # step stages this package together with those shared runtimes into verify/
+          # and proves the closure resolves there.
+          $leaked = @(Get-ChildItem $out -File | Where-Object {
+            $_.Name -like 'ggml*.dll' -or $_.Name -match '^(cudart|cublas|cublasLt)\d+_\d+\.dll$'
+          })
+          if ($leaked.Count -gt 0) {
+            throw "SeasonThreeD must not package shared runtimes: $($leaked.Name -join ', ') - SeasonGGML and cudacudnn-runtime provide them."
           }
 
           $manifest = @(
             "trellis.cpp : $env:TRELLIS_COMMIT"
-            "season3d    : $env:SEASON3D_COMMIT (C ABI shim + apply-capi-lane.ps1)"
-            "ggml        : $env:GGML_COMMIT ($env:GGML_URL)"
-            "backend     : ${{ github.event.inputs.backend }}"
+            "SeasonThreeD: $env:SEASONTHREED_COMMIT (C ABI shim + apply-capi-lane.ps1)"
+            "ggml        : $env:GGML_COMMIT ($env:GGML_REPO @ $env:GGML_REF)"
+            "ggml source : $env:GGML_URL - vendored into trellis.cpp thirdparty/ggml"
+            "ggml pin    : $env:GGML_PINNED (gitlink recorded by trellis.cpp)"
+            "lanes       : trellis-cli.exe / trellis-server.exe / trellis.dll = CUDA lane (GGML_CUDA=ON)"
+            "              trellis-cli-vulkan.exe / trellis-server-vulkan.exe / trellis-vulkan.dll"
+            "              = Vulkan lane (GGML_VULKAN=${{ steps.vulkan.outputs.enabled }}, no CUDA)"
+            "              TrellisWorker.Auto runs the CUDA lane when nvcuda.dll is present, the"
+            "              Vulkan lane otherwise; both fall back to ggml-cpu-<variant>.dll."
             "configuration: ${{ github.event.inputs.configuration }}"
             "webp        : ${{ github.event.inputs.trellis_webp }}"
             "GGML_NATIVE : OFF"
             "GGML_OPENMP : OFF"
-            "ggml linkage: shared (BUILD_SHARED_LIBS=ON, GGML_BACKEND_DL=OFF, GGML_MAX_NAME=128)"
+            "ggml linkage: shared, GGML_BACKEND_DL=ON (BUILD_SHARED_LIBS=ON, GGML_MAX_NAME=128)"
+            "ggml runtime: NOT PACKAGED - ggml.dll / ggml-base.dll / ggml-cpu-<variant>.dll /"
+            "              ggml-cuda.dll / ggml-vulkan.dll come from SeasonGGML's package at run time"
+            "requires    : ggml_ref identical to the SeasonGGML build of the same release,"
+            "              and cudacudnn-runtime next to the app for cudart/cublas/cublasLt"
             "api lane    : thin C ABI - trellis.dll exports trellis_run_argv/trellis_api_version"
             "              (parse_args+trellis_run, the same pair trellis-cli.exe runs)"
+            "cuda        : ${{ github.event.inputs.cuda_version }} (${{ github.event.inputs.cuda_architectures }})"
           )
-
-          if ('${{ github.event.inputs.backend }}' -eq 'cuda') {
-            $manifest += "cuda        : ${{ github.event.inputs.cuda_version }} (${{ github.event.inputs.cuda_architectures }})"
-          }
 
           $manifest += ""
           $manifest += "Artifact contents:"
@@ -297,22 +486,26 @@ jobs:
           # which only surfaces in a consumer as EntryPointNotFoundException. Read
           # the export table with dumpbin instead of loading the image, so the check
           # works on a runner that has no GPU driver to start the dll at all.
-          $dll = 'out/runtimes/win-x64/native/trellis.dll'
-          if (-not (Test-Path $dll)) { throw "trellis.dll is missing from the package" }
+          # Both lanes are asserted: the Vulkan dll is a separate image with its own
+          # table, and it is the copy an AMD/Intel machine loads.
+          foreach ($leaf in @('trellis.dll', 'trellis-vulkan.dll')) {
+            $dll = "out/runtimes/win-x64/native/$leaf"
+            if (-not (Test-Path $dll)) { throw "$leaf is missing from the package" }
 
-          $exports = (& dumpbin /nologo /exports $dll 2>&1) -join "`n"
-          if ($LASTEXITCODE -ne 0) { throw "dumpbin /exports failed on $dll" }
+            $exports = (& dumpbin /nologo /exports $dll 2>&1) -join "`n"
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin /exports failed on $dll" }
 
-          # extern "C" keeps these unmangled, so plain name matching is enough.
-          foreach ($symbol in @('trellis_run_argv', 'trellis_api_version')) {
-            if ($exports -notmatch "\b$symbol\b") {
-              throw "trellis.dll does not export $symbol - the C ABI lane degraded to a plain dll"
+            # extern "C" keeps these unmangled, so plain name matching is enough.
+            foreach ($symbol in @('trellis_run_argv', 'trellis_api_version')) {
+              if ($exports -notmatch "\b$symbol\b") {
+                throw "$leaf does not export $symbol - the C ABI lane degraded to a plain dll"
+              }
             }
-          }
 
-          $exports -split "`n" |
-            Where-Object { $_ -match 'trellis_run_argv|trellis_api_version' } |
-            ForEach-Object { Write-Host "export: $($_.Trim())" }
+            $exports -split "`n" |
+              Where-Object { $_ -match 'trellis_run_argv|trellis_api_version' } |
+              ForEach-Object { Write-Host "$leaf export: $($_.Trim())" }
+          }
 
       - name: Verify runtime dependencies
         shell: pwsh
@@ -323,13 +516,68 @@ jobs:
           # the dependency that actually broke the first run sat two levels down
           # (ggml.dll -> ggml-cuda.dll -> nvcuda.dll). Walk the whole closure and
           # classify every node:
-          #   package - shipped here, recurse into it
+          #   package - present in the staged folder, recurse into it
           #   host    - System32 (OS, VC redist), i.e. the target machine has it
           #   driver  - the NVIDIA driver API: not shippable, absent on a GPU-less
           #             runner, so it cannot gate the build either
           #   missing - would fail on every machine: fail the job
           $out = "out/runtimes/win-x64/native"
-          $driverProvided = @('nvcuda.dll', 'nvcuda64.dll', 'nvml.dll', 'nvapi64.dll')
+
+          # SeasonThreeD ships no ggml and no CUDA runtime any more; an application
+          # gets them from SeasonGGML and cudacudnn-runtime, which SeasonStudio stages
+          # into the same output folder. Reproduce that layout instead of testing a
+          # package that would only be complete in isolation: this package + the ggml
+          # modules the build just produced + the toolkit's cudart / cublas / cublasLt.
+          $verify = "verify/win-x64"
+          Remove-Item $verify -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $verify | Out-Null
+          Copy-Item (Join-Path $out '*') $verify -Recurse -Force
+
+          # ggml: each build tree carries ggml.dll + ggml-base.dll and one module per
+          # backend it was configured with (ggml-cuda in the CUDA lane, ggml-vulkan in
+          # the Vulkan lane). SeasonGGML ships the union of both plus the
+          # ggml-cpu-<variant>.dll set, so stage the union here: the two lanes' workers
+          # are checked side by side and each has to resolve against the same folder.
+          # ggml_backend_load_best() scores either cpu layout, so this is the same code
+          # path the product takes.
+          $ggml = @()
+          foreach ($lane in @('cuda', 'vulkan')) {
+            $ggml += @(Get-ChildItem "build-$lane" -Recurse -File -Filter 'ggml*.dll' -ErrorAction SilentlyContinue)
+          }
+          foreach ($name in @('ggml.dll', 'ggml-base.dll')) {
+            if (-not ($ggml | Where-Object { $_.Name -eq $name })) {
+              throw "the build produced no $name - BUILD_SHARED_LIBS / GGML_BACKEND_DL changed?"
+            }
+          }
+          $ggml | ForEach-Object { Copy-Item $_.FullName $verify -Force }
+
+          # Verification-only probe, never packaged: enumerating the registry is the
+          # only way to see whether the DL modules next to ggml.dll were found at all.
+          # One per lane, because they link different kernels.
+          foreach ($lane in @('cuda', 'vulkan')) {
+            $devicesExe = Get-ChildItem "build-$lane" -Recurse -File -Filter 'trellis-devices.exe' -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if (-not $devicesExe) { throw "build-$lane has no trellis-devices.exe - it is missing from the --target list" }
+            Copy-Item $devicesExe.FullName (Join-Path $verify "trellis-devices-$lane.exe") -Force
+          }
+
+          # Same version the build linked against, i.e. what cudacudnn-runtime ships.
+          # The CUDA lane is always built now, so this is unconditional.
+          $cudaRoot = $env:CUDA_PATH
+          if (-not $cudaRoot) { throw "CUDA_PATH is not set" }
+          foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            $dll = Get-ChildItem -Path $cudaRoot -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if (-not $dll) { throw "$pattern not found under $cudaRoot" }
+            Write-Host "Staging $($dll.Name) for verification"
+            Copy-Item $dll.FullName $verify -Force
+          }
+
+          # Both the NVIDIA driver API and the Vulkan loader are the target machine's
+          # business: neither is shippable, and a GPU-less runner has neither, so
+          # classifying them as driver-provided is what keeps this gate about the
+          # package instead of about the runner.
+          $driverProvided = @('nvcuda.dll', 'nvcuda64.dll', 'nvml.dll', 'nvapi64.dll', 'vulkan-1.dll')
 
           function Get-Imports {
             param([string]$Path)
@@ -348,18 +596,20 @@ jobs:
 
           $resolved = @{}
           $queue = [System.Collections.Generic.Queue[string]]::new()
-          # Both lanes, because they are separate images with their own import
-          # tables: the dll is loaded by an application process, so a dependency
-          # missing from its closure fails just as hard as for the exe.
-          foreach ($name in @('trellis-cli.exe', 'trellis-server.exe', 'trellis.dll')) {
-            $queue.Enqueue((Join-Path $out $name))
+          # Every image in the package, because each has its own import table: the
+          # dlls are loaded by an application process, and the two lanes link different
+          # GPU runtimes, so a dependency missing from either closure fails just as hard
+          # as for the exe it belongs to.
+          foreach ($name in @('trellis-cli.exe', 'trellis-server.exe', 'trellis.dll',
+                              'trellis-cli-vulkan.exe', 'trellis-server-vulkan.exe', 'trellis-vulkan.dll')) {
+            $queue.Enqueue((Join-Path $verify $name))
           }
 
           while ($queue.Count -gt 0) {
             $binary = $queue.Dequeue()
             foreach ($dll in (Get-Imports $binary)) {
               if ($resolved.ContainsKey($dll)) { continue }
-              $packaged = Join-Path $out $dll
+              $packaged = Join-Path $verify $dll
               if (Test-Path $packaged) {
                 $resolved[$dll] = 'package'
                 $queue.Enqueue($packaged)
@@ -398,49 +648,109 @@ jobs:
             Write-Host "Host-only dependencies, provided by the target machine's GPU driver: $($driverless -join ', ')"
           }
 
-      - name: Smoke test packaged trellis-cli
+      - name: Smoke test the staged layout
         shell: pwsh
         run: |
-          # The cuda build imports nvcuda.dll through ggml-cuda.dll, so the process
-          # cannot even be created on a host without an NVIDIA driver - which is
-          # every GitHub-hosted Windows runner. That is a property of the host, not
-          # of the package, and nothing can be bundled to fix it, so the dynamic
-          # check is conditional. The import closure above is what gates the
-          # artifact on CI; this step proves the packaged layout loads for real
-          # whenever a driver exists (self-hosted runner, developer machine).
-          if ('${{ github.event.inputs.backend }}' -eq 'cuda' -and
-              -not (Test-Path (Join-Path $env:SystemRoot "System32\nvcuda.dll"))) {
-            $msg = "Dynamic smoke test skipped: this runner has no NVIDIA driver (System32/nvcuda.dll is absent) and a cuda build cannot be loaded without one. The import closure check passed; run trellis-cli.exe --help on a machine with a driver."
-            Write-Host "::warning::$msg"
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- $msg" -Encoding utf8
-            return
+          # Runs against verify/win-x64 - this package plus the ggml modules and the
+          # CUDA runtime an application would have next to it. With
+          # GGML_BACKEND_DL=ON a missing NVIDIA driver no longer stops the process:
+          # ggml-cuda.dll simply fails to load, no CUDA device is registered, and
+          # trellis falls back to CPU. So unlike the old DL=OFF package - where
+          # ggml.dll hard-imported ggml-cuda.dll and every GPU-less runner had to skip
+          # this step - the dynamic check now runs everywhere, including CI.
+          $ErrorActionPreference = 'Continue'
+          $verify = "verify/win-x64"
+
+          $hint = @{
+            -1073741515 = '0xC0000135 STATUS_DLL_NOT_FOUND - a DLL in the import closure is missing'
+            -1073741511 = '0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND - a DLL was found but does not export what the exe needs (ABI-mismatched ggml)'
+            -1073741701 = '0xC000007B STATUS_INVALID_IMAGE_FORMAT - 32/64-bit mix-up or a corrupted DLL'
           }
 
           # --help prints its usage to stderr, and GitHub's pwsh wrapper enables
           # $ErrorActionPreference=Stop, which turns a native stderr write into a
           # terminating error. Merge the streams and judge the process by its exit
           # code alone.
-          $ErrorActionPreference = 'Continue'
-          $usage = & "out/runtimes/win-x64/native/trellis-cli.exe" --help 2>&1 | Out-String
-          $code = $LASTEXITCODE
-          Write-Host $usage
-
-          if ($code -ne 0) {
-            $hint = switch ($code) {
-              -1073741515 { '0xC0000135 STATUS_DLL_NOT_FOUND - a DLL in the import closure is missing' }
-              -1073741511 { '0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND - a DLL was found but does not export what the exe needs (ABI-mismatched ggml)' }
-              -1073741701 { '0xC000007B STATUS_INVALID_IMAGE_FORMAT - 32/64-bit mix-up or a corrupted DLL' }
-              default      { 'no known mapping; see dependencies.txt in the artifact' }
-            }
-            throw "trellis-cli.exe --help failed with exit code $code ($hint)"
+          function Invoke-WorkerHelp {
+            param([string]$Exe, [string]$Label)
+            $usage = & (Join-Path $verify $Exe) --help 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            Write-Host "--- $Label ($Exe) ---"
+            Write-Host $usage
+            return $code
           }
 
-          Write-Host 'trellis-cli.exe --help exited 0: the packaged layout loads.'
+          $cudaCode = Invoke-WorkerHelp 'trellis-cli.exe' 'CUDA lane'
+          if ($cudaCode -ne 0) {
+            $why = if ($hint.ContainsKey($cudaCode)) { $hint[$cudaCode] } else { 'no known mapping; see dependencies.txt in the artifact' }
+            throw "trellis-cli.exe --help failed with exit code $cudaCode ($why)"
+          }
+          Write-Host 'trellis-cli.exe --help exited 0: the CUDA lane loads.'
 
-          # trellis.dll imports the same closure as this exe (trellis_core is
-          # static in both), so a layout that starts the exe starts the dll too.
-          # Its export table is asserted in 'Verify C ABI lane exports' rather than
-          # by loading it here, because loading it would need the same GPU driver.
+          # The Vulkan lane's only shippable-adjacent dependency is the Vulkan loader,
+          # which comes with the graphics driver. A runner without one cannot start the
+          # exe at all, and that says nothing about the package - so the same rule the
+          # CUDA device check uses applies here: absent driver, skipped, not failed.
+          $vulkanLoadable = Test-Path (Join-Path $env:SystemRoot "System32\vulkan-1.dll")
+          $vulkanCode = Invoke-WorkerHelp 'trellis-cli-vulkan.exe' 'Vulkan lane'
+          if ($vulkanCode -ne 0) {
+            if ($vulkanCode -eq -1073741515 -and -not $vulkanLoadable) {
+              Write-Host 'trellis-cli-vulkan.exe cannot start on this runner: no vulkan-1.dll in System32, i.e. no Vulkan loader. Expected on a GPU-less runner, not shippable.'
+            } else {
+              $why = if ($hint.ContainsKey($vulkanCode)) { $hint[$vulkanCode] } else { 'no known mapping; see dependencies.txt in the artifact' }
+              throw "trellis-cli-vulkan.exe --help failed with exit code $vulkanCode ($why)"
+            }
+          } else {
+            Write-Host 'trellis-cli-vulkan.exe --help exited 0: the Vulkan lane loads.'
+          }
+
+          # The one failure mode this build model can introduce: a DL=ON ggml whose
+          # registry stays empty because no backend module sits next to it. Then every
+          # ggml_backend_dev_init() fails and trellis has no CPU fallback at all - it
+          # would still pass --help, so it needs its own assertion. Checked per lane:
+          # both workers link the same tree but different kernels.
+          foreach ($lane in @('cuda', 'vulkan')) {
+            $devicesExe = Join-Path $verify "trellis-devices-$lane.exe"
+            $devices = & $devicesExe 2>&1 | Out-String
+            $devicesCode = $LASTEXITCODE
+            Write-Host "--- trellis-devices-$lane ---"
+            Write-Host $devices
+            if ($devicesCode -ne 0) { throw "trellis-devices-$lane.exe failed with exit code $devicesCode" }
+
+            if ($devices -notmatch '(?m)^\s*\[\d+\]\s+CPU\s+devices:\s*[1-9]') {
+              throw "ggml's registry has no CPU backend ($lane lane): GGML_BACKEND_DL=ON found no ggml-cpu module next to the exe. trellis would have no device to run on."
+            }
+
+            # A GPU is the runner's business, the backend module is ours: when the
+            # driver is there, the corresponding module must have registered devices.
+            if ($lane -eq 'cuda') {
+              if ($devices -match '(?m)^\s*\[\d+\]\s+CUDA\s+devices:\s*[1-9]') {
+                Write-Host 'CUDA backend registered with at least one device.'
+              } elseif (-not (Test-Path (Join-Path $env:SystemRoot "System32\nvcuda.dll"))) {
+                Write-Host 'CUDA backend not registered: this runner has no NVIDIA driver, which is expected and not shippable.'
+              } else {
+                throw "a CUDA build found no CUDA device although nvcuda.dll is present - ggml-cuda.dll is missing from the layout, failed to load, or its CUDA arch list omits this GPU"
+              }
+            } elseif ('${{ steps.vulkan.outputs.enabled }}' -ne 'true') {
+              # The lane was configured without ggml-vulkan (vulkan_kernels=off, or the
+              # runner has no Vulkan SDK). No module exists to register a device, and the
+              # two custom kernels keep their CPU implementations - correct, just slow.
+              Write-Host 'Vulkan backend not registered: this lane was built without ggml-vulkan, so deform_conv/decimate_qem stay on the CPU.'
+            } elseif ($vulkanLoadable) {
+              if ($devices -match '(?m)^\s*\[\d+\]\s+Vulkan\s+devices:\s*[1-9]') {
+                Write-Host 'Vulkan backend registered with at least one device.'
+              } else {
+                throw "the Vulkan lane found no Vulkan device although vulkan-1.dll is present - ggml-vulkan.dll is missing from the layout or failed to load"
+              }
+            } else {
+              Write-Host 'Vulkan backend not registered: this runner has no Vulkan loader, which is expected and not shippable.'
+            }
+          }
+
+          # The dlls import the same closure as the exes (trellis_core is static in
+          # both), so a layout that starts an exe starts its dll too. Their export
+          # tables are asserted in 'Verify C ABI lane exports' rather than by loading
+          # them here.
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
@@ -449,6 +759,6 @@ jobs:
         # red run with no downloadable artifact helps nobody.
         if: always()
         with:
-          name: trellis-win-x64-${{ github.event.inputs.backend }}-${{ github.event.inputs.configuration }}
+          name: trellis-win-x64-${{ github.event.inputs.configuration }}
           path: out/runtimes/win-x64/native/
           if-no-files-found: error

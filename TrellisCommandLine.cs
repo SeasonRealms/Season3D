@@ -1,6 +1,6 @@
 // Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
-// https://github.com/SeasonRealms/Season3D
+// https://github.com/SeasonRealms/SeasonThreeD
 
 namespace Season.ThreeD;
 
@@ -16,7 +16,11 @@ internal static class TrellisCommandLine
     // thin parts outright instead of failing, so the worker rejects it.
     private const int MinimumFaceTarget = 1000;
 
-    public static IReadOnlyList<string> Build(TrellisSessionOptions session, TrellisGenerationOptions options)
+    public static IReadOnlyList<string> Build(
+        TrellisSessionOptions session,
+        TrellisGenerationOptions options,
+        TrellisWorker worker,
+        string? backendOverride = null)
     {
         Validate(session, options);
 
@@ -32,10 +36,13 @@ internal static class TrellisCommandLine
             "--res", ((int)options.Resolution).ToString(CultureInfo.InvariantCulture)
         };
 
-        if (!string.IsNullOrWhiteSpace(session.Backend))
+        // The retry's override, then whatever this lane has to pin on its own (see
+        // ForcedBackend), then the caller's own value.
+        var backend = backendOverride ?? ForcedBackend(session, worker) ?? session.Backend?.Trim();
+        if (!string.IsNullOrWhiteSpace(backend))
         {
             args.Add("--backend");
-            args.Add(session.Backend.Trim());
+            args.Add(backend);
         }
 
         if (session.ThreadCount > 0)
@@ -236,6 +243,33 @@ internal static class TrellisCommandLine
         }
 
         return args;
+    }
+
+    /// <summary>
+    /// The backend this build pins on the caller's behalf, or null when the caller already
+    /// decided. Only the Vulkan lane needs one: it shares an output folder with SeasonGGML's
+    /// <c>ggml-cuda.dll</c>, so left alone the worker would initialize the CUDA device while
+    /// its deformable-conv and QEM kernels are SPIR-V. A negative <c>GpuIndex</c> is an
+    /// explicit CPU request and outranks the lane default.
+    /// </summary>
+    /// <remarks>
+    /// Returned rather than folded into <see cref="Build"/> because pinning the backend also
+    /// takes the worker's own CPU fallback away; the caller re-creates it (one retry with
+    /// <c>--backend CPU</c>) and needs to know whether it pinned anything.
+    /// </remarks>
+    internal static string? ForcedBackend(TrellisSessionOptions session, TrellisWorker worker)
+    {
+        if (!string.IsNullOrWhiteSpace(session.Backend))
+        {
+            return null;
+        }
+
+        if (session.GpuIndex < 0)
+        {
+            return null;
+        }
+
+        return worker == TrellisWorker.Vulkan ? "Vulkan" : null;
     }
 
     private static void Validate(TrellisSessionOptions session, TrellisGenerationOptions options)

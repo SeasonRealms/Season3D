@@ -1,6 +1,6 @@
 // Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
-// https://github.com/SeasonRealms/Season3D
+// https://github.com/SeasonRealms/SeasonThreeD
 
 namespace Season.ThreeD;
 
@@ -80,6 +80,12 @@ public sealed class TrellisRuntimeInfo
 {
     /// <summary>Resolved executable path.</summary>
     public required string ExecutablePath { get; init; }
+
+    /// <summary>
+    /// The lane that executable belongs to, read off its file name - so a probe reports
+    /// which of the two workers actually answered, not just that one did.
+    /// </summary>
+    public TrellisWorker Worker { get; init; }
 
     /// <summary>Win32/dylib file version, when the linker stamped one.</summary>
     public string? FileVersion { get; init; }

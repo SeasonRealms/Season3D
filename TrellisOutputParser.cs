@@ -1,6 +1,6 @@
 // Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
-// https://github.com/SeasonRealms/Season3D
+// https://github.com/SeasonRealms/SeasonThreeD
 
 namespace Season.ThreeD;
 

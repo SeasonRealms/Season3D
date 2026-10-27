@@ -1,10 +1,10 @@
 # Copyright (c) SeasonEngine and contributors.
 # Licensed under the MIT License.
-# https://github.com/SeasonRealms/Season3D
+# https://github.com/SeasonRealms/SeasonThreeD
 
 <#
 .SYNOPSIS
-Adds the Season3D thin C ABI lane to a trellis.cpp checkout, so that build
+Adds the SeasonThreeD thin C ABI lane to a trellis.cpp checkout, so that build
 produces trellis.dll next to trellis-cli.exe.
 
 .DESCRIPTION
@@ -90,8 +90,8 @@ if (Select-String -Path $cmakeLists -Pattern 'season_trellis' -Quiet) {
 # CMake verbatim.
 $block = @(
     ''
-    '# --- Season3D thin C ABI lane ------------------------------------------'
-    '# Appended by Season3D/native/apply-capi-lane.ps1. trellis-cli.exe and'
+    '# --- SeasonThreeD thin C ABI lane ----------------------------------------'
+    '# Appended by SeasonThreeD/native/apply-capi-lane.ps1. trellis-cli.exe and'
     '# trellis-server.exe keep building unchanged; this target only adds a third'
     '# entry point into the same objects, exported as trellis.dll.'
     'add_library(season_trellis SHARED src/trellis_capi.cpp src/trellis_cli.cpp src/trellis_args.cpp)'

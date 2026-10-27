@@ -1,8 +1,40 @@
 // Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
-// https://github.com/SeasonRealms/Season3D
+// https://github.com/SeasonRealms/SeasonThreeD
 
 namespace Season.ThreeD;
+
+/// <summary>
+/// Which of the two shipped workers a session runs. trellis.cpp's two custom GPU
+/// kernels - BiRefNet's deformable conv and the QEM decimator - are compiled against
+/// exactly one graphics API, so the pipeline is built twice: a CUDA lane (both kernels
+/// native, no shader compilation) and a Vulkan lane (both as SPIR-V, so one binary
+/// covers NVIDIA, AMD and Intel with no CUDA runtime dependency). Both run on the
+/// product's shared ggml runtime and both fall back to ggml's CPU backend when no
+/// device initializes.
+/// </summary>
+public enum TrellisWorker
+{
+    /// <summary>
+    /// The CUDA lane on a machine with the NVIDIA driver (<c>nvcuda.dll</c>), the
+    /// Vulkan lane everywhere else - whichever of the two is actually shipped wins.
+    /// The default.
+    /// </summary>
+    Auto = 0,
+
+    /// <summary>
+    /// The plain worker (<c>trellis-cli</c>): the CUDA lane on the shipped Windows
+    /// payload, and the only worker a Linux/macOS local build produces (HIP/Metal
+    /// there, since those builds have no Vulkan lane either).
+    /// </summary>
+    Cuda = 1,
+
+    /// <summary>
+    /// The Vulkan worker (<c>trellis-cli-vulkan</c>): NVIDIA, AMD and Intel through
+    /// <c>ggml-vulkan.dll</c>, and the lane to use where no CUDA device exists.
+    /// </summary>
+    Vulkan = 2
+}
 
 /// <summary>
 /// Which flow weights the model directory holds. Both families share the TRELLIS.2
@@ -118,7 +150,7 @@ public enum TrellisStage
     Completed = 8
 }
 
-/// <summary>Severity attached to a line forwarded to <see cref="Season3D.SetLogCallback"/>.</summary>
+/// <summary>Severity attached to a line forwarded to <see cref="SeasonThreeD.SetLogCallback"/>.</summary>
 public enum TrellisLogLevel
 {
     /// <summary>Standard output (stage banners, sampler progress, timings).</summary>

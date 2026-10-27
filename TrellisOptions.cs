@@ -1,6 +1,6 @@
 // Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
-// https://github.com/SeasonRealms/Season3D
+// https://github.com/SeasonRealms/SeasonThreeD
 
 namespace Season.ThreeD;
 
@@ -12,22 +12,51 @@ namespace Season.ThreeD;
 public sealed class TrellisSessionOptions
 {
     /// <summary>
-    /// trellis-cli executable. <see langword="null"/> finds it next to the managed
-    /// assembly (flat output root, then <c>runtimes/&lt;rid&gt;/native</c>), honours the
-    /// <c>SEASON3D_TRELLIS_CLI</c> environment variable, and finally probes PATH.
+    /// Worker executable. <see langword="null"/> resolves the lane
+    /// <see cref="Worker"/> asks for next to the managed assembly (flat output root,
+    /// then <c>runtimes/&lt;rid&gt;/native</c>) and finally on PATH.
     /// </summary>
+    /// <remarks>
+    /// An explicit path always wins, including over <see cref="Worker"/>: the lane is
+    /// then read off the file name, so pointing this at a local
+    /// <c>trellis-cli-vulkan.exe</c> selects the Vulkan lane without setting
+    /// <see cref="Worker"/> as well.
+    /// </remarks>
     public string? ExecutablePath { get; set; }
+
+    /// <summary>
+    /// Which shipped worker the session runs. <see cref="TrellisWorker.Auto"/> - the
+    /// default - takes the CUDA lane on a machine with the NVIDIA driver and the Vulkan
+    /// lane everywhere else. See <see cref="SeasonThreeD.AvailableWorkers"/> for what is
+    /// actually installed.
+    /// </summary>
+    public TrellisWorker Worker { get; set; } = TrellisWorker.Auto;
 
     /// <summary>GGUF model directory (<c>--models</c>). Required.</summary>
     public string ModelsPath { get; set; } = "models";
 
-    /// <summary>GPU index (<c>--gpu</c>); a negative value runs on the CPU.</summary>
+    /// <summary>
+    /// GPU index (<c>--gpu</c>); a negative value runs on the CPU. On the Vulkan lane a
+    /// negative value also suppresses the implicit <c>--backend Vulkan</c>, because an
+    /// explicit <c>--backend</c> outranks <c>--gpu</c> inside the worker.
+    /// </summary>
     public int GpuIndex { get; set; }
 
     /// <summary>
-    /// Force a ggml backend by registry name (<c>--backend</c>): <c>CUDA</c>,
-    /// <c>Vulkan</c>, <c>CPU</c>, <c>HTP</c>, and so on. Empty selects automatically.
+    /// Force one ggml backend by registry name (<c>--backend</c>): <c>CUDA</c>,
+    /// <c>Vulkan</c>, <c>CPU</c>. Empty - the default - lets the worker choose, which is
+    /// what most callers want: the CUDA lane runs on CUDA and falls back to CPU on its
+    /// own, and the Vulkan lane does the same for Vulkan.
     /// </summary>
+    /// <remarks>
+    /// The Vulkan lane is the one case the session decides for you. SeasonGGML ships
+    /// <c>ggml-cuda.dll</c> in the same folder, so on an NVIDIA machine a Vulkan worker
+    /// left to itself would initialize the CUDA device - right for ggml, wrong for
+    /// trellis, whose deformable-conv and QEM kernels in that build are SPIR-V. The
+    /// session therefore passes <c>--backend Vulkan</c> itself, retries once on
+    /// <c>CPU</c> if that backend will not initialize, and only stands aside when this
+    /// property or <see cref="GpuIndex"/> already says what to do.
+    /// </remarks>
     public string? Backend { get; set; }
 
     /// <summary>

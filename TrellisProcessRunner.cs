@@ -1,10 +1,10 @@
 // Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
-// https://github.com/SeasonRealms/Season3D
+// https://github.com/SeasonRealms/SeasonThreeD
 
 // Process.Start/Kill are unsupported on iOS and Mac Catalyst, which this package still
 // compiles for (SeasonStudio references every AI package from all of its heads). The only
-// entry points - Season3D.CreateSession/ProbeAsync - call EnsureSupported() first, so no
+// entry points - SeasonThreeD.CreateSession/ProbeAsync - call EnsureSupported() first, so no
 // worker can reach this code there; the analyzer cannot see across that guard.
 #pragma warning disable CA1416
 

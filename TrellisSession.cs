@@ -1,6 +1,6 @@
 // Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
-// https://github.com/SeasonRealms/Season3D
+// https://github.com/SeasonRealms/SeasonThreeD
 
 namespace Season.ThreeD;
 
@@ -8,7 +8,7 @@ namespace Season.ThreeD;
 /// One binding to the trellis.cpp worker: a resolved executable, one GGUF model
 /// directory, and the device/thread choices every run of this session uses. The shape
 /// follows <c>StableDiffusionContext</c> and <c>SeasonLlmModel</c> - construct through
-/// <see cref="Season3D.CreateSession"/>, keep it while the model directory is in use,
+/// <see cref="SeasonThreeD.CreateSession"/>, keep it while the model directory is in use,
 /// dispose it when done.
 /// </summary>
 /// <remarks>
@@ -38,14 +38,22 @@ public sealed class TrellisSession : IDisposable
 
         Options = options;
         ModelsPath = modelsPath;
-        ExecutablePath = TrellisRuntimeLocator.Resolve(options.ExecutablePath);
+        ExecutablePath = TrellisRuntimeLocator.Resolve(options.Worker, options.ExecutablePath);
+        Worker = TrellisRuntimeLocator.DetectLane(ExecutablePath);
         WorkingDirectory = string.IsNullOrWhiteSpace(options.WorkingDirectory)
             ? Path.GetDirectoryName(ExecutablePath) ?? AppContext.BaseDirectory
             : Path.GetFullPath(options.WorkingDirectory);
     }
 
-    /// <summary>The resolved trellis-cli executable this session runs.</summary>
+    /// <summary>The resolved trellis worker executable this session runs.</summary>
     public string ExecutablePath { get; }
+
+    /// <summary>
+    /// The lane <see cref="ExecutablePath"/> belongs to, read off its file name - the
+    /// answer to "did <see cref="TrellisWorker.Auto"/> land on CUDA or on Vulkan on this
+    /// machine?".
+    /// </summary>
+    public TrellisWorker Worker { get; }
 
     /// <summary>The absolute GGUF model directory.</summary>
     public string ModelsPath { get; }
@@ -74,24 +82,30 @@ public sealed class TrellisSession : IDisposable
 
         // Validate and build the command line before taking the lock: a bad request
         // should not queue behind a 20-minute run just to fail.
-        var arguments = TrellisCommandLine.Build(Options, options);
+        var arguments = TrellisCommandLine.Build(Options, options, Worker);
+        var pinnedBackend = TrellisCommandLine.ForcedBackend(Options, Worker);
 
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            var outcome = await TrellisProcessRunner.RunAsync(
-                ExecutablePath,
-                arguments,
-                WorkingDirectory,
-                Options.EnvironmentVariables is null
-                    ? null
-                    : new Dictionary<string, string>(Options.EnvironmentVariables),
-                Options.RunTimeout,
-                Season3D.LogCallback,
-                progress,
-                cancellationToken).ConfigureAwait(false);
+            var outcome = await RunAsync(arguments, progress, cancellationToken).ConfigureAwait(false);
+
+            // trellis falls back to the CPU by itself only when no --backend was given.
+            // The Vulkan lane has to pin one (ForcedBackend), so the fallback is
+            // re-created here: the failure happens while the backend is initialized,
+            // before a weight is read, which makes one retry cost seconds instead of
+            // the run.
+            if (pinnedBackend is not null && outcome.ExitCode != 0 && IsBackendInitFailure(outcome))
+            {
+                SeasonThreeD.LogCallback?.Invoke(
+                    TrellisLogLevel.Warning,
+                    $"[season] the {Worker} worker could not initialize '{pinnedBackend}'; retrying on the CPU backend");
+
+                arguments = TrellisCommandLine.Build(Options, options, Worker, backendOverride: "CPU");
+                outcome = await RunAsync(arguments, progress, cancellationToken).ConfigureAwait(false);
+            }
 
             if (outcome.ExitCode != 0)
             {
@@ -108,7 +122,7 @@ public sealed class TrellisSession : IDisposable
 
     /// <summary>Runs the <c>--help</c> probe against this session's executable.</summary>
     public Task<TrellisRuntimeInfo> ProbeAsync(CancellationToken cancellationToken = default)
-        => Season3D.ProbeAsync(ExecutablePath, cancellationToken);
+        => SeasonThreeD.ProbeAsync(ExecutablePath, cancellationToken);
 
     /// <summary>
     /// Marks the session unusable. An in-flight run is left to finish or cancel on its
@@ -116,10 +130,38 @@ public sealed class TrellisSession : IDisposable
     /// </summary>
     public void Dispose() => _disposed = true;
 
-    private static string BuildFailureMessage(TrellisProcessOutcome outcome)
+    private Task<TrellisProcessOutcome> RunAsync(
+        IReadOnlyList<string> arguments,
+        IProgress<TrellisProgress>? progress,
+        CancellationToken cancellationToken)
+        => TrellisProcessRunner.RunAsync(
+            ExecutablePath,
+            arguments,
+            WorkingDirectory,
+            Options.EnvironmentVariables is null
+                ? null
+                : new Dictionary<string, string>(Options.EnvironmentVariables),
+            Options.RunTimeout,
+            SeasonThreeD.LogCallback,
+            progress,
+            cancellationToken);
+
+    /// <summary>
+    /// Whether the worker gave up while initializing an explicitly requested backend.
+    /// trellis_model.cpp raises exactly two messages for that, both before the pipeline
+    /// starts: "backend '&lt;name&gt;' failed to initialize" and "unknown backend:
+    /// &lt;name&gt;" (the latter after "no backend named ..." in this build).
+    /// </summary>
+    private static bool IsBackendInitFailure(TrellisProcessOutcome outcome)
+        => outcome.ErrorLines.Any(static line =>
+            line.Contains("failed to initialize", StringComparison.Ordinal) ||
+            line.Contains("unknown backend", StringComparison.Ordinal));
+
+    private string BuildFailureMessage(TrellisProcessOutcome outcome)
     {
         var builder = new StringBuilder();
-        builder.Append("trellis-cli exited with code ");
+        builder.Append(Path.GetFileName(ExecutablePath));
+        builder.Append(" exited with code ");
         builder.Append(outcome.ExitCode.ToString(CultureInfo.InvariantCulture));
         builder.Append(" after ");
         builder.Append(outcome.Duration.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture));

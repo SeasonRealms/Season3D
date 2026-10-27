@@ -1,6 +1,6 @@
 // Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
-// https://github.com/SeasonRealms/Season3D
+// https://github.com/SeasonRealms/SeasonThreeD
 
 // Thin C ABI lane over trellis.cpp: one exported entry that runs exactly what
 // trellis-cli.exe's main() runs - trellis::parse_args() and then trellis_run().
@@ -13,7 +13,7 @@
 // upstream's options that has to be kept in sync on every pull. The command line
 // is the one contract that stays stable - trellis-cli parses it, trellis-server
 // parses it per request - so exporting it verbatim is deliberate: no upstream
-// source is modified, and Season3D reuses the same argument builder for both
+// source is modified, and SeasonThreeD reuses the same argument builder for both
 // lanes.
 //
 // This file is compiled by a target that build-trellis.yml appends to
@@ -24,7 +24,7 @@
 //
 // Contract: one call at a time per process. trellis_run() publishes the parsed
 // knobs through globals (see the g_* declarations in trellis_args.h), so two
-// concurrent calls in one process would race. Season3D serializes its calls for
+// concurrent calls in one process would race. SeasonThreeD serializes its calls for
 // the worker lane for the same reason.
 //
 // Known limits of this lane, both inherited from upstream: output and progress

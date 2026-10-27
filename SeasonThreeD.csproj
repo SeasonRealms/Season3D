@@ -1,0 +1,135 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+    <LangVersion>preview</LangVersion>
+    <AssemblyName>SeasonThreeD</AssemblyName>
+    <RootNamespace>Season.ThreeD</RootNamespace>
+    <PackageId>SeasonThreeD</PackageId>
+    <Title>SeasonThreeD</Title>
+    <Authors>SeasonRealms</Authors>
+    <Company>SeasonRealms</Company>
+    <Description>SeasonThreeD wraps the trellis.cpp image-to-3D worker (TRELLIS.2 / Pixal3D, GGML) for SeasonEngine: run one image through the trellis-cli pipeline and get a textured GLB back, with stage/step progress and cancellation.</Description>
+    <PackageTags>trellis;trellis.cpp;ggml;3d;image-to-3d;mesh;glb;ai;seasonengine</PackageTags>
+    <PackageProjectUrl>https://github.com/SeasonRealms/SeasonThreeD</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/SeasonRealms/SeasonThreeD</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <Version>0.1.0</Version>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS1572;CS1573</NoWarn>
+
+    <!--
+      No net10.0-browser target: trellis.cpp is a desktop worker process, and
+      System.Diagnostics.Process does not exist in the wasm BCL. Android/iOS/Mac
+      Catalyst compile (SeasonStudio references every AI package from all of its
+      heads) but report PlatformNotSupportedException at run time - only Windows,
+      Linux and macOS can host the worker.
+    -->
+    <TargetFrameworks>net10.0-android;net10.0-ios;net10.0-maccatalyst;net10.0</TargetFrameworks>
+    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks>
+
+    <IsAndroid Condition="$(TargetFramework.Contains('android'))">true</IsAndroid>
+    <IsIOS Condition="$(TargetFramework.Contains('ios'))">true</IsIOS>
+    <IsMacCatalyst Condition="$(TargetFramework.Contains('maccatalyst'))">true</IsMacCatalyst>
+    <IsWindows Condition="$(TargetFramework.Contains('windows'))">true</IsWindows>
+
+    <IsLinux Condition="'$(TargetFramework)' == 'net10.0'">true</IsLinux>
+
+    <IsApple Condition="'$(IsIOS)' == 'true' or '$(IsMacCatalyst)' == 'true'">true</IsApple>
+    <IsUnixLike Condition="'$(IsAndroid)' == 'true' or '$(IsLinux)' == 'true'">true</IsUnixLike>
+
+    <SupportedOSPlatformVersion Condition="'$(IsIOS)' == 'true'">15.0</SupportedOSPlatformVersion>
+    <SupportedOSPlatformVersion Condition="'$(IsMacCatalyst)' == 'true'">15.0</SupportedOSPlatformVersion>
+    <SupportedOSPlatformVersion Condition="'$(IsAndroid)' == 'true'">29.0</SupportedOSPlatformVersion>
+    <SupportedOSPlatformVersion Condition="'$(IsWindows)' == 'true'">10.0.17763.0</SupportedOSPlatformVersion>
+    <TargetPlatformMinVersion Condition="'$(IsWindows)' == 'true'">10.0.17763.0</TargetPlatformMinVersion>
+
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Windows x64 payload produced by .github/workflows/build-trellis.yml, one
+      artifact per build but two lanes inside it:
+
+        trellis-cli.exe / trellis-server.exe        + trellis.dll
+        trellis-cli-vulkan.exe / trellis-server-vulkan.exe + trellis-vulkan.dll
+
+      The plain names are the CUDA lane (trellis's own deform_conv and decimate
+      kernels compiled as CUDA; the fastest on an NVIDIA card, and it refuses any
+      non-CUDA GPU device). The -vulkan names are the Vulkan lane: the same two
+      kernels as SPIR-V, so one binary covers NVIDIA, AMD and Intel, with no
+      dependency on cudart at all. The split is not cosmetic - a CUDA build links
+      cudart64_12 into its kernels and never compiles the shaders, so a single
+      binary cannot serve an AMD or Intel machine without dragging the CUDA runtime
+      onto it and leaving deform_conv on the CPU.
+
+      trellis.dll / trellis-vulkan.dll are the thin C ABI lanes: they export
+      trellis_run_argv, which runs the same parse_args()+trellis_run() pair the cli
+      runs; the entry point is native/trellis_capi.cpp, attached to the trellis.cpp
+      build by native/apply-capi-lane.ps1, which the workflow and a local build both
+      run. Both dlls export the same two symbols, so the lane is a file name and not
+      an ABI.
+
+      ggml is NOT in this package. trellis is built with GGML_BACKEND_DL=ON, the
+      model SeasonGGML publishes, so ggml.dll / ggml-base.dll and the
+      ggml-cpu-<variant>.dll / ggml-cuda.dll / ggml-vulkan.dll modules are discovered
+      at run time from the directory of the loading .exe - the app output folder,
+      where SeasonGGML already puts them (see the ProjectReference below). One ggml
+      runtime serves trellis, llm, sd, tts and stt. A second copy here would not
+      merely duplicate ~135 MB: the loader binds the first ggml.dll it finds in a
+      directory, so whichever copy won the race would silently impose its ABI on
+      every AI package in the process - NETSDK1152 is that collision, one step
+      earlier.
+
+      cudart64_12 / cublas64_12 / cublasLt64_12 are not here either; cudacudnn-runtime
+      provides them (SeasonStudio stages that folder next to the app). Only the CUDA
+      lane needs them: on a host without cudacudnn-runtime, TrellisWorker.Auto still
+      resolves to the Vulkan lane, which has no CUDA import at all.
+
+      Two invariants tie the packages together, both enforced by the workflow:
+        * the ggml commit SeasonGGML was built from (SeasonRealms/ggml's
+          season-0.27.0-trellis1 tag - the 0.27.0 runtime plus the fastdiv fix and
+          the GGML_PREC_F32 FlashAttention patches trellis's results depend on) -
+          ggml.dll, ggml-cpu-*.dll, ggml-cuda.dll and ggml-vulkan.dll all exchange
+          ggml_tensor layouts across the boundary, so a revision skew is a crash or
+          silent corruption, not a clean failure;
+        * the CUDA toolkit version (12.8.1, what cudacudnn-runtime ships).
+
+      The Exclude lists below are the belt to that braces: a stale local build of the
+      runtimes folder cannot reintroduce the conflict.
+    -->
+    <None Include="runtimes\win-x64\native\*" Exclude="runtimes\win-x64\native\ggml*.dll;runtimes\win-x64\native\cudart64_*.dll;runtimes\win-x64\native\cublas64_*.dll;runtimes\win-x64\native\cublasLt64_*.dll" Pack="true" PackagePath="runtimes/win-x64/native/" Condition="Exists('runtimes\win-x64\native')" />
+    <None Include="runtimes\linux-x64\native\*" Pack="true" PackagePath="runtimes/linux-x64/native/" Condition="Exists('runtimes\linux-x64\native')" />
+
+    <!-- The globs below copy both lanes into the output root: -vulkan.exe / -vulkan.dll
+         need no item of their own, only the file names the workflow renames them to. -->
+    <Content Include="runtimes\win-x64\native\*.exe;runtimes\win-x64\native\*.dll" Exclude="runtimes\win-x64\native\ggml*.dll;runtimes\win-x64\native\cudart64_*.dll;runtimes\win-x64\native\cublas64_*.dll;runtimes\win-x64\native\cublasLt64_*.dll" Condition="Exists('runtimes\win-x64\native')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>%(Filename)%(Extension)</Link>
+      <Pack>false</Pack>
+    </Content>
+
+    <Content Include="runtimes\linux-x64\native\*" Exclude="runtimes\linux-x64\native\*.h;runtimes\linux-x64\native\*.txt" Condition="Exists('runtimes\linux-x64\native')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>%(Filename)%(Extension)</Link>
+      <Pack>false</Pack>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Supplies ggml.dll, ggml-base.dll and the ggml-cpu-<variant>.dll / ggml-cuda.dll
+      backend modules to the output folder - and to the dependency graph of every
+      consumer - without shipping a second copy. SeasonGGML owns the ggml build for the
+      whole product; this reference makes the shared runtime an explicit contract
+      instead of an assumption about the app's layout.
+    -->
+    <ProjectReference Include="..\SeasonGGML\SeasonGGML.csproj" />
+  </ItemGroup>
+
+</Project>
