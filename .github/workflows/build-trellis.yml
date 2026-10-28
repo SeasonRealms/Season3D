@@ -297,6 +297,68 @@ jobs:
           # CMake project and next to src/trellis_cli.cpp + src/trellis_args.cpp.
           & seasonthreed-src/native/apply-capi-lane.ps1 -TrellisSource trellis-src
 
+      # ggml's backend entry points are not in ggml.dll: with GGML_BACKEND_DL=ON
+      # ggml-cpu / ggml-cuda / ggml-vulkan are MODULE libraries that ggml only
+      # add_dependencies() on, so there is no import library and
+      # ggml_backend_cpu_init() & co. cannot be linked. A source that calls one of
+      # them fails as C3861 (trellis.cpp deliberately does not include ggml-cpu.h)
+      # or, if someone "fixes" that by adding the include, as LNK2019 at the very
+      # end of the build. Both outcomes are how this lane last broke; the point of
+      # this step is to make the next occurrence fail in seconds instead of after a
+      # full CUDA compile.
+      #
+      # The symbol set is read out of ggml's own headers rather than listed here, so
+      # a ggml bump that adds an entry point extends the guard automatically. What a
+      # backend may be reached through instead is the registry: the helpers in
+      # include/trellis_sched.h (ggml_backend_dev_by_type + ggml_backend_dev_init,
+      # ggml_backend_get_device / ggml_backend_dev_type) and
+      # ggml_backend_reg_get_proc_address() for the backend-private functions.
+      #
+      # Legal shapes are filtered out rather than reported: a symbol named only as a
+      # string for get_proc_address(), a symbol named only inside decltype() to
+      # recover its signature, symbols behind // comments, and thirdparty/ (the ggml
+      # tree itself). --untracked is what makes src/trellis_capi.cpp visible - the C
+      # ABI shim is copied in by the step above and exists only as an untracked file.
+      - name: Check sources stay on the backend registry API
+        shell: pwsh
+        run: |
+          $src     = 'trellis-src'
+          $ggmlInc = 'trellis-src/thirdparty/ggml/include'
+          $exempt  = @()
+          $skip    = @('thirdparty')
+
+          # Entry point = the identifier right before '(' on a GGML_BACKEND_API line.
+          $syms = foreach ($h in 'ggml-cpu.h', 'ggml-cuda.h', 'ggml-vulkan.h', 'ggml-metal.h') {
+            foreach ($line in Get-Content -LiteralPath (Join-Path $ggmlInc $h) -ErrorAction SilentlyContinue) {
+              if ($line -match 'GGML_BACKEND_API\s+.*?([A-Za-z_]\w*)\s*\(') { $matches[1] }
+            }
+          }
+          $syms = @($syms | Sort-Object -Unique | Where-Object { $exempt -notcontains $_ })
+          # Fail closed: a silently empty set would leave this step green forever.
+          if ($syms.Count -lt 60) {
+            throw "read only $($syms.Count) backend entry points from $ggmlInc - ggml's headers changed shape and the guard cannot be trusted"
+          }
+
+          $word     = '(?<![A-Za-z0-9_])(?:' + ($syms -join '|') + ')(?![A-Za-z0-9_])'
+          $pathspec = @('.') + ($skip | ForEach-Object { ":(exclude)$_" })
+          $raw      = git -C $src grep --untracked -n -I -w -E ($syms -join '|') -- @pathspec
+          if ($LASTEXITCODE -gt 1) { throw "git grep failed with $LASTEXITCODE" }
+
+          $bad = foreach ($hit in $raw) {
+            $file, $line, $text = $hit -split ':', 3
+            if ($text -match 'get_proc_address|decltype') { continue }
+            $code = $text -replace '"[^"]*"', '""' -replace '//.*$', '' -replace '/\*[^*]*\*/', ''
+            if ($code -notmatch $word) { continue }
+            "${file}:${line}: $($code.Trim())"
+          }
+
+          if ($bad) {
+            $bad | ForEach-Object { Write-Host $_ }
+            throw "$($bad.Count) backend-module symbol(s) referenced directly - use the registry API described above"
+          }
+          Write-Host "no backend entry point is referenced outside comments and registry lookups ($($syms.Count) checked)"
+          exit 0
+
       - name: Setup MSVC Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -826,4 +888,8 @@ jobs:
         with:
           name: trellis-win-x64-${{ github.event.inputs.configuration }}
           path: out/runtimes/win-x64/native/
-          if-no-files-found: error
+          # warn, not error: out/ is created by Package, so a compile or link failure
+          # upstream of it legitimately has nothing to upload. Failing this step too
+          # would stack a second red on top of the error that actually stopped the run,
+          # which is exactly the noise that made the first DL=ON failure hard to read.
+          if-no-files-found: warn
