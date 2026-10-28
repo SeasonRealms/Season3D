@@ -555,6 +555,9 @@ jobs:
           if (-not $ggmlModules.ContainsKey('ggml-cuda.dll')) {
             throw 'the CUDA lane produced no ggml-cuda.dll - the packaged runtime would be CPU/Vulkan only'
           }
+          if ('${{ steps.vulkan.outputs.enabled }}' -eq 'true' -and -not $ggmlModules.ContainsKey('ggml-vulkan.dll')) {
+            throw 'the Vulkan lane was configured with GGML_VULKAN=ON but produced no ggml-vulkan.dll - the SPIR-V deform/decimate kernels would have no backend to run on'
+          }
           foreach ($entry in $ggmlModules.GetEnumerator()) {
             Copy-Item $entry.Value (Join-Path $out $entry.Key) -Force
           }
@@ -814,11 +817,23 @@ jobs:
           }
           Write-Host 'trellis-cli.exe --help exited 0: the CUDA lane loads.'
 
-          # The Vulkan lane's only shippable-adjacent dependency is the Vulkan loader,
-          # which comes with the graphics driver. A runner without one cannot start the
-          # exe at all, and that says nothing about the package - so the same rule the
-          # CUDA device check uses applies here: absent driver, skipped, not failed.
+          # Two different things used to be one flag here, and that is what a red run
+          # exposed. The Vulkan *loader* (System32\vulkan-1.dll) is now installed by
+          # the Vulkan SDK this workflow uses itself, so on a GPU-less runner the file
+          # exists while there is no GPU at all - it only proves an exe can start. What
+          # a driver installs is an ICD manifest, and the loader's only source of
+          # physical devices is that registry key: the Vulkan counterpart of nvcuda.dll
+          # in the CUDA branch below. Verified at build time, because a runner with the
+          # loader but no ICD silently registers zero devices.
+          $vulkanIcd = @()
+          try {
+            $vkDrivers = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers' -ErrorAction Stop
+            $vulkanIcd = @($vkDrivers.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' } | ForEach-Object { $_.Name })
+          } catch {
+            $vulkanIcd = @()
+          }
           $vulkanLoadable = Test-Path (Join-Path $env:SystemRoot "System32\vulkan-1.dll")
+          Write-Host ("Vulkan loader present: {0}; ICD manifests registered: {1}" -f $vulkanLoadable, $(if ($vulkanIcd.Count -gt 0) { $vulkanIcd -join ', ' } else { 'none' }))
           $vulkanCode = Invoke-WorkerHelp 'trellis-cli-vulkan.exe' 'Vulkan lane'
           if ($vulkanCode -ne 0) {
             if ($vulkanCode -eq -1073741515 -and -not $vulkanLoadable) {
@@ -830,6 +845,13 @@ jobs:
           } else {
             Write-Host 'trellis-cli-vulkan.exe --help exited 0: the Vulkan lane loads.'
           }
+
+          # ggml's own load errors are compiled out in Release (load_backend runs with
+          # silent = true under NDEBUG), so an unloadable backend module leaves no trace
+          # but a missing "[n] Vulkan devices:" line. Print what is actually next to the
+          # probe, so the next red run explains itself instead of needing a re-run.
+          $stagedModules = (Get-ChildItem $verify -File -Filter 'ggml-*.dll' | ForEach-Object { $_.Name } | Sort-Object) -join ', '
+          Write-Host "ggml modules staged in verify: $stagedModules"
 
           # The one failure mode this build model can introduce: a DL=ON ggml whose
           # registry stays empty because no backend module sits next to it. Then every
@@ -863,14 +885,16 @@ jobs:
               # runner has no Vulkan SDK). No module exists to register a device, and the
               # two custom kernels keep their CPU implementations - correct, just slow.
               Write-Host 'Vulkan backend not registered: this lane was built without ggml-vulkan, so deform_conv/decimate_qem stay on the CPU.'
-            } elseif ($vulkanLoadable) {
-              if ($devices -match '(?m)^\s*\[\d+\]\s+Vulkan\s+devices:\s*[1-9]') {
-                Write-Host 'Vulkan backend registered with at least one device.'
-              } else {
-                throw "the Vulkan lane found no Vulkan device although vulkan-1.dll is present - ggml-vulkan.dll is missing from the layout or failed to load"
-              }
+            } elseif ($vulkanIcd.Count -eq 0) {
+              # The loader is there but no driver registered an ICD, so there is no
+              # physical device for ggml-vulkan to bind to - and ggml's DL load in a
+              # Release build says nothing about it (load_backend is called with
+              # silent = true under NDEBUG). The package is fine; the runner has no GPU.
+              Write-Host 'Vulkan backend not registered: this runner has the loader but no Vulkan driver (no ICD manifest registered), which is expected and not shippable.'
+            } elseif ($devices -match '(?m)^\s*\[\d+\]\s+Vulkan\s+devices:\s*[1-9]') {
+              Write-Host 'Vulkan backend registered with at least one device.'
             } else {
-              Write-Host 'Vulkan backend not registered: this runner has no Vulkan loader, which is expected and not shippable.'
+              throw "the Vulkan lane registered no device although a Vulkan ICD is installed - ggml-vulkan.dll is missing from the layout, failed to load, or found no usable device (staged modules: $stagedModules)"
             }
           }
 
