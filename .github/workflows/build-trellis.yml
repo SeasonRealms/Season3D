@@ -9,29 +9,31 @@ name: build-trellis.yml
 # add_subdirectory(thirdparty/ggml)). The commit trellis.cpp pins in its gitlink
 # is still read out and printed next to the one actually built, so drift between
 # the two lineages shows up in the job summary instead of going unnoticed.
-# Freezing the build = passing a commit/tag in trellis_ref - and, when the ggml
-# side has to be pinned as well, in ggml_ref; both resolved commits are printed,
-# written to the artifact manifest and recorded in the job summary so a later
-# run can be reproduced commit-for-commit.
-# An artifact is therefore the triple (trellis_ref, ggml_ref, this repository's
-# commit): the one source file this repository contributes - the C ABI shim - is
-# taken from the checkout of the commit that triggered the run, and that commit
-# is recorded next to the trellis and ggml ones.
+# Freezing the build = passing a commit/tag in trellis_ref. ggml_ref defaults to
+# SeasonRealms/ggml `master`, the branch every package in the product builds from,
+# and it is not pinned to a tag: because that branch moves, the commits the two
+# checkouts actually resolved to are printed, written to the artifact manifest and
+# recorded in the job summary. The manifest is what makes a later rebuild
+# reproducible - not the ref name.
+# An artifact is therefore the triple (resolved trellis commit, resolved ggml
+# commit, this repository's commit): the one source file this repository
+# contributes - the C ABI shim - is taken from the checkout of the commit that
+# triggered the run, and that commit is recorded next to the trellis and ggml ones.
 #
 # SeasonThreeD ships two entry points into the same code, and the package carries
 # both:
 #
 #   trellis-cli.exe / trellis-server.exe - the worker lane. trellis_core is linked
-#     statically into them, but the ggml they run on is NOT packaged here: ggml is
-#     built with GGML_BACKEND_DL=ON (the model SeasonGGML publishes), so the runtime
-#     is ggml.dll + ggml-base.dll plus backend modules, and at run time trellis
-#     discovers whatever sits next to the loading .exe. In a SeasonStudio output
-#     folder that is SeasonGGML's ggml-cpu-<variant>.dll / ggml-cuda.dll, and
-#     cudacudnn-runtime's cudart64_12 / cublas / cublasLt - one copy for trellis,
-#     llm, sd, tts and stt alike. Shipping a second, differently configured ggml.dll
-#     here would not just duplicate 135 MB: the loader keeps the first copy it finds,
-#     so the other half of the product would silently run against an ABI it was not
-#     built for (NETSDK1152 is that collision, one step earlier).
+#     statically into them, and the ggml they run on IS packaged here: this build
+#     compiles SeasonRealms/ggml anyway (trellis.cpp's CMake consumes it through
+#     add_subdirectory), so the runtime it produced - ggml.dll, ggml-base.dll,
+#     ggml-cpu-<variant>.dll, ggml-cuda.dll, ggml-vulkan.dll - is collected into the
+#     artifact instead of being produced by a second SeasonGGML run. That is only
+#     sound because the options are SeasonGGML's options (GGML_BACKEND_DL=ON,
+#     GGML_CPU_ALL_VARIANTS=ON, GGML_MAX_NAME=128): whichever package a given module
+#     is taken from, it is the same module. The CUDA redistributables stay out -
+#     cudart / cublas / cublasLt are several hundred MB and come from
+#     cudacudnn-runtime, which SeasonStudio stages next to every AI package.
 #
 #   trellis.dll - the thin C ABI lane. trellis.cpp exposes no C header and its
 #     core is STATIC, so this is our own single export: trellis_run_argv(), the
@@ -45,19 +47,20 @@ name: build-trellis.yml
 #
 # Two pins are part of that contract and have to match the rest of the product:
 #
-#   ggml_ref       - must be the commit SeasonGGML was built from. ggml.dll,
-#                    ggml-base.dll and the backend modules all pass ggml_tensor and
-#                    the backend vtables across the boundary, so a revision skew
-#                    surfaces as STATUS_ENTRYPOINT_NOT_FOUND or as silent corruption.
-#                    It defaults to SeasonRealms/ggml's `season-0.27.0-trellis1` tag:
-#                    ggml-org/ggml 0.27.0 plus the four patches trellis.cpp's results
-#                    depend on (fastdiv UB above 2^31, GGML_PREC_F32 honoured in the
-#                    TILE / VEC / MMA FlashAttention kernels, and the GGML_FA_DEBUG
-#                    dispatch line). Plain upstream 0.27 compiles and links, then
-#                    returns a different latent: res-1024 dense scenes take a GPU page
-#                    fault in fastdiv and the FA bias goes 13x (NVIDIA MMA) or ~120
-#                    sigma (AMD TILE) out. Never point this at a bare mirror again -
-#                    SeasonGGML must build from the very same tag.
+#   ggml_ref       - must resolve to the same ggml the other packages were built
+#                    from. ggml.dll, ggml-base.dll and the backend modules all pass
+#                    ggml_tensor and the backend vtables across the boundary, so a
+#                    revision skew surfaces as STATUS_ENTRYPOINT_NOT_FOUND or as
+#                    silent corruption. It defaults to SeasonRealms/ggml `master`,
+#                    which carries upstream 0.27.0 plus the patches trellis.cpp's
+#                    results depend on (fastdiv UB above 2^31, GGML_PREC_F32 honoured
+#                    in the TILE / VEC / MMA FlashAttention kernels, and the
+#                    GGML_FA_DEBUG dispatch line). Plain upstream 0.27 compiles and
+#                    links, then returns a different latent: res-1024 dense scenes
+#                    take a GPU page fault in fastdiv and the FA bias goes 13x
+#                    (NVIDIA MMA) or ~120 sigma (AMD TILE) out - so point this at a
+#                    tree that has those patches, and at the tree the other four
+#                    packages use.
 #   cuda_version   - must be the toolkit cudacudnn-runtime ships (12.8.1): both
 #                    ggml-cuda.dll and trellis's own kernels (deform_conv,
 #                    decimate_qem) link cudart64_12.dll.
@@ -77,9 +80,10 @@ name: build-trellis.yml
 #                                               - the Vulkan lane (GGML_VULKAN=ON, no
 #     CUDA at all); both kernels are SPIR-V compute shaders, so one binary covers
 #     NVIDIA, AMD and Intel through ggml-vulkan.dll and still falls back to
-#     ggml-cpu-<variant>.dll when no Vulkan device is usable. Configured with the
-#     Vulkan SDK's glslc when the runner has one; otherwise the lane is built without
-#     ggml-vulkan and keeps the CPU deform fallback.
+#     ggml-cpu-<variant>.dll when no Vulkan device is usable. The workflow installs
+#     the Vulkan SDK so glslc is always there; on a runner without it the lane is
+#     built without ggml-vulkan and keeps the CPU deform fallback (an explicit
+#     vulkan_kernels=off does the same on purpose).
 #   trellis.dll / trellis-vulkan.dll            - the same two lanes as C ABI dlls.
 #
 # Splitting by lane instead of by vendor is deliberate: a CUDA build links cudart64_12
@@ -88,13 +92,14 @@ name: build-trellis.yml
 # CPU. The managed lane picks the worker per machine (TrellisWorker.Auto: nvcuda.dll
 # present -> CUDA worker, else Vulkan worker) and both are addressable explicitly.
 #
-# One consequence worth knowing when reading a run: SeasonGGML ships ggml-cuda.dll and
-# ggml-vulkan.dll in the same folder, so a Vulkan worker left to itself would pick the
-# CUDA device on an NVIDIA machine - right for ggml, wrong for trellis, whose kernels in
-# that build are SPIR-V. SeasonThreeD therefore passes --backend Vulkan for that lane and
-# retries once on --backend CPU when the backend will not initialize, which is what keeps
-# the CPU fallback the worker would otherwise do on its own. Neither lane relies on
-# anything from this workflow beyond the two files being named as they are.
+# One consequence worth knowing when reading a run: this artifact ships ggml-cuda.dll
+# and ggml-vulkan.dll in the same folder (SeasonGGML's does too), so a Vulkan worker
+# left to itself would pick the CUDA device on an NVIDIA machine - right for ggml,
+# wrong for trellis, whose kernels in that build are SPIR-V. SeasonThreeD therefore
+# passes --backend Vulkan for that lane and retries once on --backend CPU when the
+# backend will not initialize, which is what keeps the CPU fallback the worker would
+# otherwise do on its own. Neither lane relies on anything from this workflow beyond
+# the files being named as they are.
 
 
 on:
@@ -113,9 +118,15 @@ on:
         required: true
         default: "main"
       ggml_ref:
-        description: "SeasonRealms/ggml tag / branch / commit (a commit or tag freezes the ggml side; must equal SeasonGGML's build)"
+        description: "SeasonRealms/ggml tag / branch / commit (must resolve to the ggml the other packages build; the resolved commit is recorded)"
         required: true
-        default: "season-0.27.0-trellis1"
+        # SeasonRealms/ggml's master, not a tag: this workflow compiles that tree
+        # itself and ships the resulting ggml*.dll, so the product no longer needs a
+        # separate SeasonGGML run to get its runtime. Because the branch moves, the
+        # commit it resolved to is printed into the summary, the manifest and
+        # dependencies.txt; that commit - not this default - is what reproduces a
+        # build. Pass a commit here to freeze one anyway.
+        default: "master"
       vulkan_kernels:
         description: "Vulkan lane: compile the SPIR-V deform_conv/decimate kernels (needs the Vulkan SDK's glslc)"
         required: true
@@ -255,13 +266,17 @@ jobs:
             Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $_ -Encoding utf8
           }
 
-          # Expected most of the time (SeasonRealms/ggml tracks pwilkin master,
-          # trellis.cpp pins pwilkin's "trellis" branch), but never silent: the
-          # CUDA fixes that live only on that branch are lost when the commits
-          # differ, which is a behaviour change worth seeing in the run log.
+          # trellis.cpp still records pwilkin/ggml@f8697b33 as its gitlink, while the
+          # tree this build vendors comes from ggml_ref. That substitution is the
+          # design, not drift: SeasonRealms/ggml master already carries the
+          # FlashAttention-precision and fastdiv patches trellis.cpp's results depend
+          # on, and it is the ref SeasonGGML / SeasonLLM / SeasonImage / SeasonTTS
+          # build too, which is what keeps ggml_tensor one ABI across the product.
+          # Reported as a plain line so the run log still names both commits, without
+          # claiming a regression the artifact does not have.
           if ($ggmlPinned -ne $ggmlCommit) {
-            $note = "ggml built here ($ggmlCommit) is not the commit trellis.cpp pins ($ggmlPinned); see the assessment of branch-only patches before shipping."
-            Write-Host "::warning::$note"
+            $note = "ggml vendored at $ggmlCommit ($env:GGML_REF) replaces the pwilkin/ggml commit trellis.cpp records ($ggmlPinned); intended - master carries that branch's FA-precision and fastdiv patches and is the ref the other packages build from."
+            Write-Host $note
             Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- $note" -Encoding utf8
           }
 
@@ -295,6 +310,14 @@ jobs:
         with:
           cuda: "${{ github.event.inputs.cuda_version }}"
 
+      - name: Install Vulkan SDK
+        # Installed, not probed: the image has no Vulkan SDK, so "auto" used to
+        # resolve to false on every run and the Vulkan lane shipped with the CPU
+        # implementations of deform_conv / decimate_qem - a lane that exists for
+        # AMD and Intel and then runs minutes per attempt. SeasonGGML installs the
+        # same action for ggml-vulkan; this lane needs it just as much.
+        uses: jakoch/install-vulkan-sdk-action@v1
+
       - name: Detect the Vulkan SDK
         id: vulkan
         shell: pwsh
@@ -303,12 +326,23 @@ jobs:
           # with glslc, which only ships in the Vulkan SDK. "auto" means: use it when
           # this runner has it; without it the lane still builds and runs, only with
           # the CPU implementations of both kernels - correct, but minutes per run.
+          # That fallback is for runners without the SDK, not for the product: the
+          # step above installs it, and 'vulkan_kernels=off' remains the only way to
+          # ask for the CPU lane on purpose.
           $choice = '${{ github.event.inputs.vulkan_kernels }}'
           $glslc = Get-Command glslc -ErrorAction SilentlyContinue
           $enable = switch ($choice) {
             'on'   { if (-not $glslc) { throw "vulkan_kernels=on, but glslc is not on PATH - install the Vulkan SDK on this runner" }; $true }
             'off'  { $false }
-            default { [bool]$glslc }
+            default {
+              if (-not $glslc) {
+                # Loud, because the resulting package looks complete: the lane
+                # starts, picks ggml-vulkan, and every run then falls back to the
+                # CPU kernels.
+                Write-Host "::warning::vulkan_kernels=auto found no glslc after installing the Vulkan SDK - the Vulkan lane ships with the CPU deform_conv/decimate fallback"
+              }
+              [bool]$glslc
+            }
           }
 
           # FindVulkan() keys off VULKAN_SDK, and a runner that only has glslc on PATH
@@ -354,10 +388,18 @@ jobs:
             #     ggml + ggml-base - which is what lets both packages run on ONE ggml
             #     runtime instead of shipping two.
             # The backend modules are still compiled (ggml's CMake makes ggml depend on
-            # them), but Package deliberately ships no ggml dll and no cudart/cublas:
-            # the artifact is the workers plus the two lane dlls.
+            # them) and are now packaged (see Package): ggml.dll, ggml-base.dll, the
+            # ggml-cpu-<variant>.dll set, ggml-cuda.dll and ggml-vulkan.dll ship with
+            # the workers so no separate SeasonGGML run is needed. cudart / cublas /
+            # cublasLt are still excluded - they come from cudacudnn-runtime.
             '-DBUILD_SHARED_LIBS=ON',
             '-DGGML_BACKEND_DL=ON',
+            # Same CPU module layout as SeasonGGML / SeasonImage / SeasonTTS
+            # (GGML_CPU_ALL_VARIANTS=ON): ggml-cpu.dll becomes the dispatcher and the
+            # per-ISA implementations sit next to it. Drop this and the set this
+            # artifact ships would differ from SeasonGGML's, so a folder holding
+            # copies from both would dispatch on whichever arrived first.
+            '-DGGML_CPU_ALL_VARIANTS=ON',
             "-DTRELLIS_WEBP=${{ github.event.inputs.trellis_webp }}"
           )
 
@@ -430,19 +472,44 @@ jobs:
           Copy-Item trellis-src/LICENSE -Destination (Join-Path $out "trellis.txt") -Force
           Copy-Item trellis-src/thirdparty/ggml/LICENSE -Destination (Join-Path $out "ggml.txt") -Force
 
-          # No ggml and no cudart/cublas in this package. Both are shared with the rest
-          # of the product - SeasonGGML's ggml.dll + ggml-base.dll + backend modules,
-          # cudacudnn-runtime's cudart / cublas / cublasLt - and a second copy in the
-          # same output directory is the one thing that cannot work: the loader binds
-          # the first ggml.dll it finds, so whichever package lost the race would run
-          # against an ABI it was never compiled for. The 'Verify runtime dependencies'
-          # step stages this package together with those shared runtimes into verify/
-          # and proves the closure resolves there.
+          # The ggml runtime this build produced, packaged here. That is the point of
+          # the whole arrangement: this workflow compiles the same SeasonRealms/ggml
+          # tree a SeasonGGML run would, so its output is collected instead of being
+          # rebuilt by a second run. Both lanes are merged because they differ in
+          # exactly the one module each was configured for - ggml-cuda.dll exists only
+          # in build-cuda, ggml-vulkan.dll only in build-vulkan when the SDK was found -
+          # while ggml.dll / ggml-base.dll / ggml-cpu-<variant>.dll are identical in
+          # both and simply collapse in the name-keyed table below.
+          $ggmlModules = @{}
+          foreach ($lane in @('cuda', 'vulkan')) {
+            Get-ChildItem "build-$lane" -Recurse -File -Filter 'ggml*.dll' -ErrorAction SilentlyContinue |
+              ForEach-Object { $ggmlModules[$_.Name] = $_.FullName }
+          }
+          foreach ($name in @('ggml.dll', 'ggml-base.dll')) {
+            if (-not $ggmlModules.ContainsKey($name)) {
+              throw "the build produced no $name - BUILD_SHARED_LIBS / GGML_BACKEND_DL changed?"
+            }
+          }
+          if (-not $ggmlModules.ContainsKey('ggml-cuda.dll')) {
+            throw 'the CUDA lane produced no ggml-cuda.dll - the packaged runtime would be CPU/Vulkan only'
+          }
+          foreach ($entry in $ggmlModules.GetEnumerator()) {
+            Copy-Item $entry.Value (Join-Path $out $entry.Key) -Force
+          }
+          Write-Host ("ggml modules packaged: {0}" -f (($ggmlModules.Keys | Sort-Object) -join ', '))
+
+          # The CUDA redistributables stay out: several hundred MB, not ggml's to ship,
+          # and cudacudnn-runtime already stages exactly the version trellis linked
+          # against. Asserted rather than assumed - a second cudart in the output folder
+          # is the kind of drift that only surfaces as STATUS_ENTRYPOINT_NOT_FOUND on a
+          # user's machine. The 'Verify runtime dependencies' step stages cudart /
+          # cublas from the toolkit into verify/ and proves the closure resolves.
           $leaked = @(Get-ChildItem $out -File | Where-Object {
-            $_.Name -like 'ggml*.dll' -or $_.Name -match '^(cudart|cublas|cublasLt)\d+_\d+\.dll$'
+            $_.Name -match '^(cudart|cublas|cublasLt|nvrtc|cufft|curand|cusparse|nvJitLink)\d+_\d+\.dll$' -or
+            $_.Name -like 'cudnn*.dll'
           })
           if ($leaked.Count -gt 0) {
-            throw "SeasonThreeD must not package shared runtimes: $($leaked.Name -join ', ') - SeasonGGML and cudacudnn-runtime provide them."
+            throw "SeasonThreeD must not package the CUDA runtime: $($leaked.Name -join ', ') - cudacudnn-runtime provides it."
           }
 
           $manifest = @(
@@ -460,11 +527,14 @@ jobs:
             "webp        : ${{ github.event.inputs.trellis_webp }}"
             "GGML_NATIVE : OFF"
             "GGML_OPENMP : OFF"
-            "ggml linkage: shared, GGML_BACKEND_DL=ON (BUILD_SHARED_LIBS=ON, GGML_MAX_NAME=128)"
-            "ggml runtime: NOT PACKAGED - ggml.dll / ggml-base.dll / ggml-cpu-<variant>.dll /"
-            "              ggml-cuda.dll / ggml-vulkan.dll come from SeasonGGML's package at run time"
-            "requires    : ggml_ref identical to the SeasonGGML build of the same release,"
-            "              and cudacudnn-runtime next to the app for cudart/cublas/cublasLt"
+            "ggml linkage: shared, GGML_BACKEND_DL=ON, GGML_CPU_ALL_VARIANTS=ON, GGML_MAX_NAME=128"
+            "ggml runtime: PACKAGED HERE - ggml.dll / ggml-base.dll / ggml-cpu*.dll /"
+            "              ggml-cuda.dll / ggml-vulkan.dll were compiled by this run from"
+            "              $env:GGML_COMMIT and are interchangeable with the copies the other"
+            "              AI packages ship (same ggml_ref, same options), so no separate"
+            "              SeasonGGML build is required for this package to run"
+            "cuda runtime: NOT PACKAGED - cudart / cublas / cublasLt come from"
+            "              cudacudnn-runtime, which SeasonStudio stages next to the app"
             "api lane    : thin C ABI - trellis.dll exports trellis_run_argv/trellis_api_version"
             "              (parse_args+trellis_run, the same pair trellis-cli.exe runs)"
             "cuda        : ${{ github.event.inputs.cuda_version }} (${{ github.event.inputs.cuda_architectures }})"
@@ -523,33 +593,28 @@ jobs:
           #   missing - would fail on every machine: fail the job
           $out = "out/runtimes/win-x64/native"
 
-          # SeasonThreeD ships no ggml and no CUDA runtime any more; an application
-          # gets them from SeasonGGML and cudacudnn-runtime, which SeasonStudio stages
-          # into the same output folder. Reproduce that layout instead of testing a
-          # package that would only be complete in isolation: this package + the ggml
-          # modules the build just produced + the toolkit's cudart / cublas / cublasLt.
+          # The package now carries the ggml runtime it compiled, but still no CUDA
+          # runtime: an application gets cudart / cublas / cublasLt from
+          # cudacudnn-runtime, which SeasonStudio stages into the same output folder.
+          # Reproduce that layout instead of testing a package that would only be
+          # complete in isolation: this package (workers + ggml modules) + the
+          # toolkit's cudart / cublas / cublasLt.
           $verify = "verify/win-x64"
           Remove-Item $verify -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $verify | Out-Null
           Copy-Item (Join-Path $out '*') $verify -Recurse -Force
 
-          # ggml: each build tree carries ggml.dll + ggml-base.dll and one module per
-          # backend it was configured with (ggml-cuda in the CUDA lane, ggml-vulkan in
-          # the Vulkan lane). SeasonGGML ships the union of both plus the
-          # ggml-cpu-<variant>.dll set, so stage the union here: the two lanes' workers
-          # are checked side by side and each has to resolve against the same folder.
-          # ggml_backend_load_best() scores either cpu layout, so this is the same code
-          # path the product takes.
-          $ggml = @()
-          foreach ($lane in @('cuda', 'vulkan')) {
-            $ggml += @(Get-ChildItem "build-$lane" -Recurse -File -Filter 'ggml*.dll' -ErrorAction SilentlyContinue)
-          }
-          foreach ($name in @('ggml.dll', 'ggml-base.dll')) {
-            if (-not ($ggml | Where-Object { $_.Name -eq $name })) {
-              throw "the build produced no $name - BUILD_SHARED_LIBS / GGML_BACKEND_DL changed?"
+          # The ggml modules travel with the package now - Package copied the union of
+          # both lanes into $out, so the wildcard copy above already staged them, and
+          # both lanes' workers resolve against that one folder. Assert what the
+          # closure cannot do without; ggml-vulkan.dll is deliberately not required
+          # here, because a run with vulkan_kernels=off ships none and still has to
+          # verify.
+          foreach ($name in @('ggml.dll', 'ggml-base.dll', 'ggml-cuda.dll')) {
+            if (-not (Test-Path (Join-Path $verify $name))) {
+              throw "$name is missing from the staged package - BUILD_SHARED_LIBS / GGML_BACKEND_DL / Package changed?"
             }
           }
-          $ggml | ForEach-Object { Copy-Item $_.FullName $verify -Force }
 
           # Verification-only probe, never packaged: enumerating the registry is the
           # only way to see whether the DL modules next to ggml.dll were found at all.
