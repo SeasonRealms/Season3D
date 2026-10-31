@@ -6,3 +6,13 @@
 /bin/Debug
 /native/upstream-trellis
 /obj
+
+# Two PE files exceed GitHub's 100 MB per-file limit (ggml-cuda.dll 136 MiB,
+# ggml-vulkan.dll 40 MiB), so they stay out of history. They are produced by
+# .github/workflows/build-trellis.yml under out/runtimes/win-x64/native and
+# fetched from that run's artifact, or by a local trellis build, before packing.
+# SeasonThreeD.csproj still globs them - a staged copy is packed into the NuGet
+# package and copied to the output exactly as before; ignoring them only keeps
+# them out of the commit. Everything else under runtimes/ is tracked.
+/runtimes/win-x64/native/ggml-cuda.dll
+/runtimes/win-x64/native/ggml-vulkan.dll

@@ -1,0 +1,9 @@
+KERNEL32.dll                 host
+MSVCP140.dll                 host
+VCRUNTIME140_1.dll           host
+VCRUNTIME140.dll             host
+vulkan-1.dll                 host
+WS2_32.dll                   host
+cudart64_12.dll              package
+ggml-base.dll                package
+ggml.dll                     package

@@ -83,10 +83,22 @@
       trellis build stand on its own instead of waiting for a separate SeasonGGML run
       to supply the runtime. It does not make this package a second publisher:
       SeasonGGML still owns ggml inside the NuGet package (the Pack glob below
-      excludes ggml*), and at build time the copy here is used only when SeasonGGML's
-      runtimes folder is empty - see the conditional item after these globs. Two
-      files for one output path is NETSDK1152, and two ggml.dlls in one folder would
-      let the loader hand trellis an ABI it was not built against.
+      excludes ggml*).
+
+      At build time the worker therefore keeps its own ggml, in a folder of its own.
+      The two copies are only interchangeable while both packages build from the same
+      ggml revision, and in practice they drift: a SeasonGGML runtime staged months
+      earlier (0.15.2) next to a trellis build of 0.27.0 still loads - every export the
+      worker imports exists in both - and then computes a different mesh for the same
+      seed, the silent kind of skew. Flattening the worker into the output root would
+      make it pick up whichever ggml.dll sits there, so the Windows payload is copied
+      to runtimes\win-x64\native\ under the output folder instead: the loader resolves
+      an executable's imports from its own directory first, and ggml's backend loader
+      scans that same directory for ggml-cpu-<variant>.dll / ggml-cuda.dll, so the
+      worker's whole ggml stack comes from beside it while the app's in-process
+      packages keep SeasonGGML's copy in the root. TrellisRuntimeLocator searches that
+      folder first, and TrellisSession puts the output root on the worker's PATH for
+      the CUDA runtime below. Distinct output paths also keep NETSDK1152 away.
 
       cudart64_12 / cublas64_12 / cublasLt64_12 are not here; cudacudnn-runtime
       provides them (SeasonStudio stages that folder next to the app), and the
@@ -106,37 +118,27 @@
         * the CUDA toolkit version (12.8.1, what cudacudnn-runtime ships).
 
       The Exclude lists below are the belt to that braces: a stale local build of the
-      runtimes folder cannot reintroduce the CUDA runtime conflict, and ggml travels
-      through the conditional item below rather than the wildcard, so the two sources
-      can never both land in one output folder.
+      runtimes folder cannot reintroduce the CUDA runtime conflict.
     -->
     <None Include="runtimes\win-x64\native\*" Exclude="runtimes\win-x64\native\ggml*.dll;runtimes\win-x64\native\cudart64_*.dll;runtimes\win-x64\native\cublas64_*.dll;runtimes\win-x64\native\cublasLt64_*.dll" Pack="true" PackagePath="runtimes/win-x64/native/" Condition="Exists('runtimes\win-x64\native')" />
     <None Include="runtimes\linux-x64\native\*" Pack="true" PackagePath="runtimes/linux-x64/native/" Condition="Exists('runtimes\linux-x64\native')" />
 
-    <!-- The globs below copy both lanes into the output root: -vulkan.exe / -vulkan.dll
-         need no item of their own, only the file names the workflow renames them to. -->
-    <Content Include="runtimes\win-x64\native\*.exe;runtimes\win-x64\native\*.dll" Exclude="runtimes\win-x64\native\ggml*.dll;runtimes\win-x64\native\cudart64_*.dll;runtimes\win-x64\native\cublas64_*.dll;runtimes\win-x64\native\cublasLt64_*.dll" Condition="Exists('runtimes\win-x64\native')">
+    <!-- Both lanes and the worker's own ggml go to runtimes\win-x64\native\ in the output
+         (see above): -vulkan.exe needs no item of its own, only the file name the workflow
+         renames it to.
+
+         Windows heads only. This is a PE payload - an .exe the app starts plus the 143MB
+         ggml-cuda.dll beside it - so the other heads have nothing to do with it: without
+         the condition every Android/iOS/Mac Catalyst build also copied ~200MB of Windows
+         binaries under runtimes\win-x64\native, and for the Apple heads that is exactly the
+         "PE files inside the .app" case those projects remove elsewhere. -->
+    <Content Include="runtimes\win-x64\native\*.exe;runtimes\win-x64\native\*.dll" Exclude="runtimes\win-x64\native\cudart64_*.dll;runtimes\win-x64\native\cublas64_*.dll;runtimes\win-x64\native\cublasLt64_*.dll" Condition="'$(IsWindows)' == 'true' And Exists('runtimes\win-x64\native')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>%(Filename)%(Extension)</Link>
+      <Link>runtimes\win-x64\native\%(Filename)%(Extension)</Link>
       <Pack>false</Pack>
     </Content>
 
     <Content Include="runtimes\linux-x64\native\*" Exclude="runtimes\linux-x64\native\*.h;runtimes\linux-x64\native\*.txt" Condition="Exists('runtimes\linux-x64\native')">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>%(Filename)%(Extension)</Link>
-      <Pack>false</Pack>
-    </Content>
-
-    <!--
-      The ggml runtime this package's own workflow produced, used only when
-      SeasonGGML has not been staged. Same tree, same options, so the fallback is not
-      a second dialect - it just keeps a machine that only ran build-trellis.yml from
-      having to run build-ggml.yml as well to get a loadable ggml. The Windows globs
-      above exclude ggml*.dll, so this item is its single owner and the two sources
-      can never both reach the output folder; Pack="false" keeps SeasonGGML the
-      single owner inside the NuGet package.
-    -->
-    <Content Include="runtimes\win-x64\native\ggml*.dll" Condition="Exists('runtimes\win-x64\native') And !Exists('..\SeasonGGML\runtimes\win-x64\native\ggml.dll')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>%(Filename)%(Extension)</Link>
       <Pack>false</Pack>
@@ -146,12 +148,11 @@
   <ItemGroup>
     <!--
       Supplies ggml.dll, ggml-base.dll and the ggml-cpu-<variant>.dll / ggml-cuda.dll
-      backend modules to the output folder - and to the dependency graph of every
+      backend modules to the output root - and to the dependency graph of every
       consumer - when SeasonGGML has been staged. SeasonGGML stays the single
-      publisher of ggml inside the NuGet package, and this reference makes the shared
-      runtime an explicit contract instead of an assumption about the app's layout;
-      the conditional Content item above covers the machine where SeasonGGML has not
-      been built.
+      publisher of ggml inside the NuGet package; on Windows the worker no longer
+      reads that root copy (it carries its own, see above), the reference keeps the
+      in-process consumers' runtime an explicit contract.
     -->
     <ProjectReference Include="..\SeasonGGML\SeasonGGML.csproj" />
   </ItemGroup>

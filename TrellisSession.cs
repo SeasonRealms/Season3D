@@ -138,13 +138,49 @@ public sealed class TrellisSession : IDisposable
             ExecutablePath,
             arguments,
             WorkingDirectory,
-            Options.EnvironmentVariables is null
-                ? null
-                : new Dictionary<string, string>(Options.EnvironmentVariables),
+            BuildEnvironment(),
             Options.RunTimeout,
             SeasonThreeD.LogCallback,
             progress,
             cancellationToken);
+
+    /// <summary>
+    /// The caller's variables, plus a PATH that reaches the app when the worker lives
+    /// below it. A Windows output keeps the worker in runtimes\&lt;rid&gt;\native while
+    /// cudacudnn-runtime (cudart64_12 / cublas64_12, which ggml-cuda.dll imports) is
+    /// staged in the output root, and the loader would not look there for a process
+    /// started from the subfolder. The worker's own folder stays first, so its ggml is
+    /// never shadowed by the app's. A PATH the caller set is passed through untouched.
+    /// </summary>
+    private Dictionary<string, string>? BuildEnvironment()
+    {
+        var environment = Options.EnvironmentVariables is null
+            ? null
+            : new Dictionary<string, string>(Options.EnvironmentVariables, StringComparer.OrdinalIgnoreCase);
+
+        if (environment?.ContainsKey("PATH") == true)
+        {
+            return environment;
+        }
+
+        var workerDirectory = Path.GetDirectoryName(ExecutablePath);
+        var baseDirectory = Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory);
+
+        if (string.IsNullOrEmpty(workerDirectory) ||
+            string.Equals(Path.TrimEndingDirectorySeparator(workerDirectory), baseDirectory, StringComparison.OrdinalIgnoreCase))
+        {
+            return environment;
+        }
+
+        environment ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        environment["PATH"] = string.Join(
+            Path.PathSeparator,
+            workerDirectory,
+            baseDirectory,
+            Environment.GetEnvironmentVariable("PATH") ?? string.Empty);
+
+        return environment;
+    }
 
     /// <summary>
     /// Whether the worker gave up while initializing an explicitly requested backend.

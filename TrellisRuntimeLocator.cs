@@ -7,9 +7,10 @@ namespace Season.ThreeD;
 /// <summary>
 /// Finds the trellis worker. Unlike the other Season AI packages this is not a native
 /// library next to the managed assembly only: the workflow publishes the executables
-/// into <c>runtimes/&lt;rid&gt;/native</c>, MSBuild flattens them into the output root,
-/// and a developer may keep a local build anywhere - so the search covers all three,
-/// plus PATH.
+/// into <c>runtimes/&lt;rid&gt;/native</c>, MSBuild keeps that folder in a Windows output
+/// (the worker brings its own ggml, see SeasonThreeD.csproj) and flattens the Linux one
+/// into the output root, and a developer may keep a local build anywhere - so the search
+/// covers all three, plus PATH.
 ///
 /// Two lanes are published from one build (see
 /// <c>.github/workflows/build-trellis.yml</c>) and the packaging step tells them apart by
@@ -182,14 +183,16 @@ internal static class TrellisRuntimeLocator
     }
 
     /// <summary>
-    /// The two layouts a consumer sees: the flat output root (Content items are linked
-    /// by file name) and the RID layout preserved inside the NuGet package.
+    /// The two layouts a consumer sees: the RID layout (the Windows output and the NuGet
+    /// package) and the flat output root (the Linux Content items are linked by file
+    /// name). The RID folder goes first: a worker there loads the ggml beside it, while a
+    /// stale copy left in the root by an older build would load the app's.
     /// </summary>
     private static IEnumerable<string> EnumerateSearchDirectories()
     {
         var baseDirectory = Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory);
-        yield return baseDirectory;
         yield return Path.Combine(baseDirectory, "runtimes", GetRuntimeIdentifier(), "native");
+        yield return baseDirectory;
     }
 
     private static IEnumerable<string> EnumerateFileNames(TrellisWorker worker)
