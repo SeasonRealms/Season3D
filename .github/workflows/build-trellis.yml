@@ -30,7 +30,7 @@ name: build-trellis.yml
 #     ggml-cpu-<variant>.dll, ggml-cuda.dll, ggml-vulkan.dll - is collected into the
 #     artifact instead of being produced by a second SeasonGGML run. That is only
 #     sound because the options are SeasonGGML's options (GGML_BACKEND_DL=ON,
-#     GGML_CPU_ALL_VARIANTS=ON, GGML_MAX_NAME=128): whichever package a given module
+#     GGML_CPU_ALL_VARIANTS=ON, GGML_MAX_NAME=160): whichever package a given module
 #     is taken from, it is the same module. The CUDA redistributables stay out -
 #     cudart / cublas / cublasLt are several hundred MB and come from
 #     cudacudnn-runtime, which SeasonStudio stages next to every AI package.
@@ -592,7 +592,7 @@ jobs:
             "webp        : ${{ github.event.inputs.trellis_webp }}"
             "GGML_NATIVE : OFF"
             "GGML_OPENMP : OFF"
-            "ggml linkage: shared, GGML_BACKEND_DL=ON, GGML_CPU_ALL_VARIANTS=ON, GGML_MAX_NAME=128"
+            "ggml linkage: shared, GGML_BACKEND_DL=ON, GGML_CPU_ALL_VARIANTS=ON, GGML_MAX_NAME=160"
             "ggml runtime: PACKAGED HERE - ggml.dll / ggml-base.dll / ggml-cpu*.dll /"
             "              ggml-cuda.dll / ggml-vulkan.dll were compiled by this run from"
             "              $env:GGML_COMMIT and are interchangeable with the copies the other"

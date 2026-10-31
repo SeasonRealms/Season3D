@@ -33,13 +33,16 @@ namespace Season.ThreeD;
 /// starts and the CPU fallback still runs.
 ///
 /// The worker shares the product's ggml runtime instead of carrying its own: it is
-/// built with <c>GGML_BACKEND_DL=ON</c> and discovers <c>ggml.dll</c>,
-/// <c>ggml-base.dll</c> and the <c>ggml-cpu-&lt;variant&gt;</c> / <c>ggml-cuda</c> /
-/// <c>ggml-vulkan</c> backend modules in the directory it is started from - the app
-/// output folder, where SeasonGGML puts them. That is why this package references
-/// SeasonGGML and ships no ggml dlls of its own: two copies in one folder cannot
-/// coexist (the loader binds the first), and every AI package in the process has to
-/// agree on one ggml build anyway.
+/// built with <c>GGML_BACKEND_DL=ON</c>, so the PE loader takes <c>ggml.dll</c> and
+/// <c>ggml-base.dll</c> from the executable's own directory and
+/// <c>ggml_backend_load_all</c> scans that same directory (then the working directory)
+/// for the <c>ggml-cpu-&lt;variant&gt;</c> / <c>ggml-cuda</c> / <c>ggml-vulkan</c> backend
+/// modules. This project therefore stages the worker in the output root, where
+/// SeasonGGML copies its runtime, and a NuGet consumer gets both in
+/// <c>runtimes&lt;rid&gt;\native</c>. That is why this package references SeasonGGML and
+/// ships no ggml dlls of its own: two copies in one folder cannot coexist (the loader
+/// binds the first), and every AI package in the process has to agree on one ggml
+/// build anyway.
 ///
 /// The mode is intentionally desktop-only: the worker is a native executable, so
 /// Android, iOS and Mac Catalyst report <see cref="PlatformNotSupportedException"/>.

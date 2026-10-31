@@ -183,10 +183,12 @@ internal static class TrellisRuntimeLocator
     }
 
     /// <summary>
-    /// The two layouts a consumer sees: the RID layout (the Windows output and the NuGet
-    /// package) and the flat output root (the Linux Content items are linked by file
-    /// name). The RID folder goes first: a worker there loads the ggml beside it, while a
-    /// stale copy left in the root by an older build would load the app's.
+    /// The two layouts a consumer sees: the RID layout (the NuGet package payload) and the
+    /// flat output root (a project reference links the executables there, beside the ggml
+    /// SeasonGGML copies to that same root - the worker and its ggml must stay together,
+    /// because ggml resolves its imports and its backend modules from the executable's
+    /// directory). The RID folder still goes first so a packaged worker wins over a stale
+    /// copy an older build left in the root.
     /// </summary>
     private static IEnumerable<string> EnumerateSearchDirectories()
     {

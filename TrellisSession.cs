@@ -145,12 +145,14 @@ public sealed class TrellisSession : IDisposable
             cancellationToken);
 
     /// <summary>
-    /// The caller's variables, plus a PATH that reaches the app when the worker lives
-    /// below it. A Windows output keeps the worker in runtimes\&lt;rid&gt;\native while
-    /// cudacudnn-runtime (cudart64_12 / cublas64_12, which ggml-cuda.dll imports) is
-    /// staged in the output root, and the loader would not look there for a process
-    /// started from the subfolder. The worker's own folder stays first, so its ggml is
-    /// never shadowed by the app's. A PATH the caller set is passed through untouched.
+    /// The caller's variables, plus a PATH that reaches the app when the worker lives below
+    /// it. A NuGet consumer gets the worker in runtimes\&lt;rid&gt;\native while
+    /// cudacudnn-runtime (cudart64_12 / cublas64_12, which ggml-cuda.dll imports) is staged
+    /// in the output root, and the loader would not look there for a process started from
+    /// the subfolder. ggml itself needs no help: SeasonGGML mirrors the same RID folder into
+    /// the package, so ggml.dll sits beside the worker either way, and ggml's backend loader
+    /// scans the executable's own directory. A PATH the caller set is passed through
+    /// untouched.
     /// </summary>
     private Dictionary<string, string>? BuildEnvironment()
     {

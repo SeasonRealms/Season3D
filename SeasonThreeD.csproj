@@ -53,86 +53,79 @@
 
   <ItemGroup>
     <!--
-      Windows x64 payload produced by .github/workflows/build-trellis.yml, one
-      artifact per build but two lanes inside it:
+      Windows x64 payload produced by .github/workflows/build-trellis.yml, one artifact
+      per build but two lanes inside it:
 
-        trellis-cli.exe / trellis-server.exe        + trellis.dll
-        trellis-cli-vulkan.exe / trellis-server-vulkan.exe + trellis-vulkan.dll
+        trellis-cli.exe         - the CUDA lane
+        trellis-cli-vulkan.exe  - the Vulkan lane
 
-      The plain names are the CUDA lane (trellis's own deform_conv and decimate
-      kernels compiled as CUDA; the fastest on an NVIDIA card, and it refuses any
-      non-CUDA GPU device). The -vulkan names are the Vulkan lane: the same two
-      kernels as SPIR-V, so one binary covers NVIDIA, AMD and Intel, with no
-      dependency on cudart at all. The split is not cosmetic - a CUDA build links
-      cudart64_12 into its kernels and never compiles the shaders, so a single
-      binary cannot serve an AMD or Intel machine without dragging the CUDA runtime
-      onto it and leaving deform_conv on the CPU.
+      The plain name compiles trellis's own deform_conv and decimate kernels as CUDA
+      (fastest on an NVIDIA card, and it refuses any non-CUDA GPU device). The -vulkan
+      name is the same two kernels as SPIR-V, so one binary covers NVIDIA, AMD and Intel
+      with no dependency on cudart at all. The split is not cosmetic - a CUDA build links
+      cudart64_12 into its kernels and never compiles the shaders, so a single binary
+      cannot serve an AMD or Intel machine without dragging the CUDA runtime onto it and
+      leaving deform_conv on the CPU.
 
-      trellis.dll / trellis-vulkan.dll are the thin C ABI lanes: they export
-      trellis_run_argv, which runs the same parse_args()+trellis_run() pair the cli
-      runs; the entry point is native/trellis_capi.cpp, attached to the trellis.cpp
-      build by native/apply-capi-lane.ps1, which the workflow and a local build both
-      run. Both dlls export the same two symbols, so the lane is a file name and not
-      an ABI.
+      ggml is NOT part of this payload. The worker links ggml dynamically, so the runtime
+      it needs is exactly the one SeasonGGML publishes - same SeasonRealms/ggml ref, same
+      GGML_BACKEND_DL / GGML_CPU_ALL_VARIANTS / GGML_MAX_NAME options - and this project
+      references that package already. A second copy here is what made ggml revision skew
+      possible: both copies load, then compute different meshes for the same seed. The
+      worker is therefore staged in the output root, next to ggml.dll, so the loader
+      resolves its imports from its own directory and ggml's backend loader scans that
+      same directory for ggml-cpu-<variant>.dll / ggml-cuda.dll / ggml-vulkan.dll.
 
-      ggml is a partial exception. This build compiles SeasonRealms/ggml itself
-      (trellis.cpp's CMake consumes it through add_subdirectory) with SeasonGGML's
-      options - GGML_BACKEND_DL=ON, GGML_CPU_ALL_VARIANTS=ON, GGML_MAX_NAME=128 - so
-      the workflow collects the runtime it produced as well: ggml.dll, ggml-base.dll,
-      ggml-cpu-<variant>.dll, ggml-cuda.dll, ggml-vulkan.dll. That is what lets a
-      trellis build stand on its own instead of waiting for a separate SeasonGGML run
-      to supply the runtime. It does not make this package a second publisher:
-      SeasonGGML still owns ggml inside the NuGet package (the Pack glob below
-      excludes ggml*).
+      The executables carry no manifest item beyond the glob below; the .txt files beside
+      them (trellis.txt and the ggml license text) stay in runtimes\win-x64\native\ so
+      they cannot collide with SeasonGGML's own README.txt at the output root
+      (NETSDK1152). A worker staged the RID way - the NuGet package payload, or a
+      consumer that only got the package - still resolves ggml through
+      TrellisSession's PATH and GGML_BACKEND_PATH plumbing; TrellisRuntimeLocator
+      searches both layouts.
 
-      At build time the worker therefore keeps its own ggml, in a folder of its own.
-      The two copies are only interchangeable while both packages build from the same
-      ggml revision, and in practice they drift: a SeasonGGML runtime staged months
-      earlier (0.15.2) next to a trellis build of 0.27.0 still loads - every export the
-      worker imports exists in both - and then computes a different mesh for the same
-      seed, the silent kind of skew. Flattening the worker into the output root would
-      make it pick up whichever ggml.dll sits there, so the Windows payload is copied
-      to runtimes\win-x64\native\ under the output folder instead: the loader resolves
-      an executable's imports from its own directory first, and ggml's backend loader
-      scans that same directory for ggml-cpu-<variant>.dll / ggml-cuda.dll, so the
-      worker's whole ggml stack comes from beside it while the app's in-process
-      packages keep SeasonGGML's copy in the root. TrellisRuntimeLocator searches that
-      folder first, and TrellisSession puts the output root on the worker's PATH for
-      the CUDA runtime below. Distinct output paths also keep NETSDK1152 away.
+      cudart64_12 / cublas64_12 / cublasLt64_12 are not here either; cudacudnn-runtime
+      provides them (SeasonStudio stages that folder next to the app). Only the CUDA lane
+      needs them: on a host without cudacudnn-runtime, TrellisWorker.Auto still resolves
+      to the Vulkan lane, which has no CUDA import at all.
 
-      cudart64_12 / cublas64_12 / cublasLt64_12 are not here; cudacudnn-runtime
-      provides them (SeasonStudio stages that folder next to the app), and the
-      workflow fails the run if the toolkit's runtime leaks into the package. Only
-      the CUDA lane needs them: on a host without cudacudnn-runtime,
-      TrellisWorker.Auto still resolves to the Vulkan lane, which has no CUDA import
-      at all.
-
-      Two invariants tie the packages together, both enforced by the workflow:
-        * the ggml commit SeasonRealms/ggml's master resolved to for this run -
-          0.27.0 plus the fastdiv fix and the GGML_PREC_F32 FlashAttention patches
-          trellis's results depend on. It is recorded in the artifact manifest, and
-          every other AI package builds from that same branch, because ggml.dll,
-          ggml-cpu-*.dll, ggml-cuda.dll and ggml-vulkan.dll all exchange ggml_tensor
-          layouts across the boundary - a revision skew is a crash or silent
-          corruption, not a clean failure;
-        * the CUDA toolkit version (12.8.1, what cudacudnn-runtime ships).
+      Two invariants tie the packages together: the ggml commit SeasonRealms/ggml's
+      master resolved to (0.27.0 plus the fastdiv fix and the GGML_PREC_F32
+      FlashAttention patches), which every AI package builds from, and the CUDA toolkit
+      version (12.8.1, what cudacudnn-runtime ships).
 
       The Exclude lists below are the belt to that braces: a stale local build of the
-      runtimes folder cannot reintroduce the CUDA runtime conflict.
+      runtimes folder cannot reintroduce a second ggml or the CUDA runtime into the
+      package.
     -->
     <None Include="runtimes\win-x64\native\*" Exclude="runtimes\win-x64\native\ggml*.dll;runtimes\win-x64\native\cudart64_*.dll;runtimes\win-x64\native\cublas64_*.dll;runtimes\win-x64\native\cublasLt64_*.dll" Pack="true" PackagePath="runtimes/win-x64/native/" Condition="Exists('runtimes\win-x64\native')" />
     <None Include="runtimes\linux-x64\native\*" Pack="true" PackagePath="runtimes/linux-x64/native/" Condition="Exists('runtimes\linux-x64\native')" />
 
-    <!-- Both lanes and the worker's own ggml go to runtimes\win-x64\native\ in the output
-         (see above): -vulkan.exe needs no item of its own, only the file name the workflow
-         renames it to.
+    <!--
+      Windows heads only, and no item of their own for the lanes: -vulkan.exe is just a
+      file name the workflow renames to.
 
-         Windows heads only. This is a PE payload - an .exe the app starts plus the 143MB
-         ggml-cuda.dll beside it - so the other heads have nothing to do with it: without
-         the condition every Android/iOS/Mac Catalyst build also copied ~200MB of Windows
-         binaries under runtimes\win-x64\native, and for the Apple heads that is exactly the
-         "PE files inside the .app" case those projects remove elsewhere. -->
-    <Content Include="runtimes\win-x64\native\*.exe;runtimes\win-x64\native\*.dll" Exclude="runtimes\win-x64\native\cudart64_*.dll;runtimes\win-x64\native\cublas64_*.dll;runtimes\win-x64\native\cublasLt64_*.dll" Condition="'$(IsWindows)' == 'true' And Exists('runtimes\win-x64\native')">
+      The executables go to the output ROOT, not to runtimes\win-x64\native: the worker
+      imports ggml.dll and ggml's backend loader scans the executable's directory, so it
+      has to sit next to SeasonGGML's runtime. That is also why the payload is empty of
+      ggml (see above) - one copy, owned by SeasonGGML.
+
+      This is a PE payload, so the other heads have nothing to do with it: without the
+      condition every Android/iOS/Mac Catalyst build also copied a Windows binary set
+      under runtimes\win-x64\native, and for the Apple heads that is exactly the "PE
+      files inside the .app" case those projects remove elsewhere.
+    -->
+    <Content Include="runtimes\win-x64\native\*.exe" Condition="'$(IsWindows)' == 'true' And Exists('runtimes\win-x64\native')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>%(Filename)%(Extension)</Link>
+      <Pack>false</Pack>
+    </Content>
+
+    <!--
+      The license/manifest text stays in the RID folder: flattening it would collide with
+      SeasonGGML's own README.txt in the same output root.
+    -->
+    <Content Include="runtimes\win-x64\native\*.txt" Condition="'$(IsWindows)' == 'true' And Exists('runtimes\win-x64\native')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>runtimes\win-x64\native\%(Filename)%(Extension)</Link>
       <Pack>false</Pack>
@@ -149,10 +142,11 @@
     <!--
       Supplies ggml.dll, ggml-base.dll and the ggml-cpu-<variant>.dll / ggml-cuda.dll
       backend modules to the output root - and to the dependency graph of every
-      consumer - when SeasonGGML has been staged. SeasonGGML stays the single
-      publisher of ggml inside the NuGet package; on Windows the worker no longer
-      reads that root copy (it carries its own, see above), the reference keeps the
-      in-process consumers' runtime an explicit contract.
+      consumer - when SeasonGGML has been staged. SeasonGGML is the single publisher
+      of ggml everywhere: the root copy IS the worker's runtime on Windows (see
+      above), and the reference is what keeps both the in-process consumers and the
+      out-of-process worker on one ggml revision. Dropping it would leave the worker
+      with an unresolvable import.
     -->
     <ProjectReference Include="..\SeasonGGML\SeasonGGML.csproj" />
   </ItemGroup>
