@@ -39,16 +39,16 @@ public sealed class TrellisResult
     /// </summary>
     public uint Seed { get; init; }
 
-    /// <summary>Wall-clock time of the worker process.</summary>
+    /// <summary>Wall-clock time of the native run.</summary>
     public TimeSpan Duration { get; init; }
 
-    /// <summary>Worker exit code (0 for a completed run).</summary>
+    /// <summary>Return code of <c>trellis_run_argv</c> (0 for a completed run).</summary>
     public int ExitCode { get; init; }
 
     /// <summary>Captured stdout/stderr lines, in arrival order (capped).</summary>
     public IReadOnlyList<string> Log { get; init; } = [];
 
-    internal static TrellisResult FromRun(TrellisGenerationOptions options, TrellisProcessOutcome outcome)
+    internal static TrellisResult FromRun(TrellisGenerationOptions options, TrellisRunOutcome outcome)
     {
         var output = Path.GetFullPath(options.OutputPath);
         var directory = Path.GetDirectoryName(output) ?? string.Empty;
@@ -58,7 +58,7 @@ public sealed class TrellisResult
         {
             OutputPath = output,
             TexturePath = Existing(stem + "_base.png"),
-            // trellis-cli derives the side artifacts from the output path by truncating
+            // trellis derives the side artifacts from the output path by truncating
             // it at the last dot, so this is exactly <stem>.ply / <stem>_base.png.
             PointCloudPath = Existing(stem + ".ply"),
             CutoutPath = Existing(stem + "_cutout.png"),
@@ -73,17 +73,17 @@ public sealed class TrellisResult
 }
 
 /// <summary>
-/// Identity of a trellis-cli build: enough for the UI to show "which worker am I
-/// running?" without a native version call (the CLI has no <c>--version</c>).
+/// Identity of a trellis native build: enough for the UI to show "which lane am I
+/// running?" without a native version call (the shim has no version command).
 /// </summary>
 public sealed class TrellisRuntimeInfo
 {
-    /// <summary>Resolved executable path.</summary>
-    public required string ExecutablePath { get; init; }
+    /// <summary>Resolved native library path.</summary>
+    public required string LibraryPath { get; init; }
 
     /// <summary>
-    /// The lane that executable belongs to, read off its file name - so a probe reports
-    /// which of the two workers actually answered, not just that one did.
+    /// The lane that library belongs to, read off its file name - so a probe reports
+    /// which of the two lanes actually answered, not just that one did.
     /// </summary>
     public TrellisWorker Worker { get; init; }
 
@@ -93,10 +93,10 @@ public sealed class TrellisRuntimeInfo
     /// <summary>Product version, when the linker stamped one.</summary>
     public string? ProductVersion { get; init; }
 
-    /// <summary>Exit code of the <c>--help</c> probe (0 means the worker started).</summary>
+    /// <summary>Return code of the <c>--help</c> probe (0 means the library loaded and parsed it).</summary>
     public int ExitCode { get; init; }
 
-    /// <summary>Everything the worker printed for <c>--help</c> (usage goes to stderr).</summary>
+    /// <summary>Everything the library printed for <c>--help</c> (usage goes to stderr).</summary>
     public string HelpText { get; init; } = string.Empty;
 
     /// <summary>Whether the probe completed with exit code 0.</summary>

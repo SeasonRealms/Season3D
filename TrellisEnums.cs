@@ -5,13 +5,13 @@
 namespace Season.ThreeD;
 
 /// <summary>
-/// Which of the two shipped workers a session runs. trellis.cpp's two custom GPU
+/// Which of the two shipped lanes a session loads. trellis.cpp's two custom GPU
 /// kernels - BiRefNet's deformable conv and the QEM decimator - are compiled against
 /// exactly one graphics API, so the pipeline is built twice: a CUDA lane (both kernels
 /// native, no shader compilation) and a Vulkan lane (both as SPIR-V, so one binary
 /// covers NVIDIA, AMD and Intel with no CUDA runtime dependency). Both run on the
 /// product's shared ggml runtime and both fall back to ggml's CPU backend when no
-/// device initializes.
+/// device initializes. The lanes are dlls (<c>trellis.dll</c> / <c>trellis-vulkan.dll</c>).
 /// </summary>
 public enum TrellisWorker
 {
@@ -23,14 +23,14 @@ public enum TrellisWorker
     Auto = 0,
 
     /// <summary>
-    /// The plain worker (<c>trellis-cli</c>): the CUDA lane on the shipped Windows
-    /// payload, and the only worker a Linux/macOS local build produces (HIP/Metal
+    /// The plain library (<c>trellis.dll</c>): the CUDA lane on the shipped Windows
+    /// payload, and the only library a Linux/macOS local build produces (HIP/Metal
     /// there, since those builds have no Vulkan lane either).
     /// </summary>
     Cuda = 1,
 
     /// <summary>
-    /// The Vulkan worker (<c>trellis-cli-vulkan</c>): NVIDIA, AMD and Intel through
+    /// The Vulkan library (<c>trellis-vulkan.dll</c>): NVIDIA, AMD and Intel through
     /// <c>ggml-vulkan.dll</c>, and the lane to use where no CUDA device exists.
     /// </summary>
     Vulkan = 2

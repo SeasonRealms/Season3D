@@ -5,27 +5,27 @@
 namespace Season.ThreeD;
 
 /// <summary>
-/// Per-session knobs: where the worker lives, which GGUF directory it reads, and the
-/// device selection that applies to every run of the session. These map to the
-/// trellis-cli flags that do not change per image.
+/// Per-session knobs: where the native library lives, which GGUF directory it reads, and
+/// the device selection that applies to every run of the session. These map to the
+/// trellis argv that does not change per image.
 /// </summary>
 public sealed class TrellisSessionOptions
 {
     /// <summary>
-    /// Worker executable. <see langword="null"/> resolves the lane
-    /// <see cref="Worker"/> asks for next to the managed assembly (flat output root,
-    /// then <c>runtimes/&lt;rid&gt;/native</c>) and finally on PATH.
+    /// Native library. <see langword="null"/> resolves the lane <see cref="Worker"/> asks
+    /// for next to the managed assembly (flat output root, then
+    /// <c>runtimes/&lt;rid&gt;/native</c>) and finally on PATH.
     /// </summary>
     /// <remarks>
     /// An explicit path always wins, including over <see cref="Worker"/>: the lane is
     /// then read off the file name, so pointing this at a local
-    /// <c>trellis-cli-vulkan.exe</c> selects the Vulkan lane without setting
+    /// <c>trellis-vulkan.dll</c> selects the Vulkan lane without setting
     /// <see cref="Worker"/> as well.
     /// </remarks>
-    public string? ExecutablePath { get; set; }
+    public string? LibraryPath { get; set; }
 
     /// <summary>
-    /// Which shipped worker the session runs. <see cref="TrellisWorker.Auto"/> - the
+    /// Which shipped lane the session loads. <see cref="TrellisWorker.Auto"/> - the
     /// default - takes the CUDA lane on a machine with the NVIDIA driver and the Vulkan
     /// lane everywhere else. See <see cref="SeasonThreeD.AvailableWorkers"/> for what is
     /// actually installed.
@@ -69,27 +69,27 @@ public sealed class TrellisSessionOptions
     public bool Verbose { get; set; }
 
     /// <summary>
-    /// Working directory for the worker. Defaults to the executable's directory, which
-    /// is also where it looks for sibling helpers.
-    /// </summary>
-    public string? WorkingDirectory { get; set; }
-
-    /// <summary>
     /// Wall-clock budget for one run. <see langword="null"/> waits indefinitely - the
     /// 1024/1536 cascade legitimately takes tens of minutes on a CPU backend.
     /// </summary>
+    /// <remarks>
+    /// A budget, not a kill switch: the native lane has no deadline hook, so a run that
+    /// overruns still finishes and the oversized duration is reported as
+    /// <see cref="TimeoutException"/> afterwards.
+    /// </remarks>
     public TimeSpan? RunTimeout { get; set; }
 
     /// <summary>
-    /// Extra environment variables for the worker (the <c>TRELLIS_*</c> switches that
-    /// have no CLI flag, e.g. <c>TRELLIS_QEM_PRESERVE_TOPOLOGY</c>).
+    /// Extra environment variables for the run (the <c>TRELLIS_*</c> switches that have
+    /// no argv flag, e.g. <c>TRELLIS_QEM_PRESERVE_TOPOLOGY</c>). They are set for the
+    /// duration of the call and restored afterwards.
     /// </summary>
     public IDictionary<string, string>? EnvironmentVariables { get; set; }
 }
 
 /// <summary>
-/// One image-to-3D request. Every property maps to a trellis-cli flag; a
-/// <see langword="null"/> optional value leaves the worker's own default in place
+/// One image-to-3D request. Every property maps to a trellis command-line flag; a
+/// <see langword="null"/> optional value leaves trellis' own default in place
 /// rather than pinning a value that would drift if upstream changes it.
 /// </summary>
 public sealed class TrellisGenerationOptions

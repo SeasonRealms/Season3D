@@ -5,17 +5,17 @@
 namespace Season.ThreeD;
 
 /// <summary>
-/// One binding to the trellis.cpp worker: a resolved executable, one GGUF model
+/// One binding to the trellis.cpp pipeline: a resolved native library, one GGUF model
 /// directory, and the device/thread choices every run of this session uses. The shape
 /// follows <c>StableDiffusionContext</c> and <c>SeasonLlmModel</c> - construct through
 /// <see cref="SeasonThreeD.CreateSession"/>, keep it while the model directory is in use,
 /// dispose it when done.
 /// </summary>
 /// <remarks>
-/// There is no native handle to own (each run is a short-lived process), so this type
-/// is cheap; the <see cref="SemaphoreSlim"/> exists only to serialize concurrent
-/// <see cref="GenerateAsync"/> calls, because a second worker would load a second copy
-/// of the weights.
+/// The native image is owned process-wide (the loader deduplicates it), so this type is
+/// cheap; the <see cref="SemaphoreSlim"/> serializes concurrent <see cref="GenerateAsync"/>
+/// calls, because a second run would load a second copy of the weights, and
+/// <c>trellis_run()</c> additionally requires one call at a time per process.
 /// </remarks>
 public sealed class TrellisSession : IDisposable
 {
@@ -38,18 +38,15 @@ public sealed class TrellisSession : IDisposable
 
         Options = options;
         ModelsPath = modelsPath;
-        ExecutablePath = TrellisRuntimeLocator.Resolve(options.Worker, options.ExecutablePath);
-        Worker = TrellisRuntimeLocator.DetectLane(ExecutablePath);
-        WorkingDirectory = string.IsNullOrWhiteSpace(options.WorkingDirectory)
-            ? Path.GetDirectoryName(ExecutablePath) ?? AppContext.BaseDirectory
-            : Path.GetFullPath(options.WorkingDirectory);
+        LibraryPath = TrellisRuntimeLocator.Resolve(options.Worker, options.LibraryPath);
+        Worker = TrellisRuntimeLocator.DetectLane(LibraryPath);
     }
 
-    /// <summary>The resolved trellis worker executable this session runs.</summary>
-    public string ExecutablePath { get; }
+    /// <summary>The resolved trellis native library this session loads.</summary>
+    public string LibraryPath { get; }
 
     /// <summary>
-    /// The lane <see cref="ExecutablePath"/> belongs to, read off its file name - the
+    /// The lane <see cref="LibraryPath"/> belongs to, read off its file name - the
     /// answer to "did <see cref="TrellisWorker.Auto"/> land on CUDA or on Vulkan on this
     /// machine?".
     /// </summary>
@@ -58,20 +55,22 @@ public sealed class TrellisSession : IDisposable
     /// <summary>The absolute GGUF model directory.</summary>
     public string ModelsPath { get; }
 
-    /// <summary>The worker's working directory (its own directory by default).</summary>
-    public string WorkingDirectory { get; }
-
     /// <summary>The options this session was created with.</summary>
     public TrellisSessionOptions Options { get; }
 
     /// <summary>
     /// Runs one image through the pipeline. Throws <see cref="InvalidOperationException"/>
-    /// when the worker exits non-zero (the message carries its trailing
+    /// when the run returns non-zero (the message carries its trailing
     /// <c>[trellis]</c> lines), <see cref="OperationCanceledException"/> when
-    /// <paramref name="cancellationToken"/> fires (the worker process tree is killed),
-    /// and <see cref="TimeoutException"/> when <see cref="TrellisSessionOptions.RunTimeout"/>
-    /// expires.
+    /// <paramref name="cancellationToken"/> was signalled, and
+    /// <see cref="TimeoutException"/> when <see cref="TrellisSessionOptions.RunTimeout"/>
+    /// was exceeded.
     /// </summary>
+    /// <remarks>
+    /// Both of the last two are observed around the call, not during it: the native lane
+    /// has no cancellation or deadline hook, so the run finishes and the failure is
+    /// reported on return. A cancelled or over-budget run still wrote its output.
+    /// </remarks>
     public async Task<TrellisResult> GenerateAsync(
         TrellisGenerationOptions options,
         IProgress<TrellisProgress>? progress = null,
@@ -120,9 +119,9 @@ public sealed class TrellisSession : IDisposable
         }
     }
 
-    /// <summary>Runs the <c>--help</c> probe against this session's executable.</summary>
+    /// <summary>Runs the <c>--help</c> probe against this session's library.</summary>
     public Task<TrellisRuntimeInfo> ProbeAsync(CancellationToken cancellationToken = default)
-        => SeasonThreeD.ProbeAsync(ExecutablePath, cancellationToken);
+        => SeasonThreeD.ProbeAsync(LibraryPath, cancellationToken);
 
     /// <summary>
     /// Marks the session unusable. An in-flight run is left to finish or cancel on its
@@ -130,59 +129,18 @@ public sealed class TrellisSession : IDisposable
     /// </summary>
     public void Dispose() => _disposed = true;
 
-    private Task<TrellisProcessOutcome> RunAsync(
+    private Task<TrellisRunOutcome> RunAsync(
         IReadOnlyList<string> arguments,
         IProgress<TrellisProgress>? progress,
         CancellationToken cancellationToken)
-        => TrellisProcessRunner.RunAsync(
-            ExecutablePath,
+        => TrellisNativeRunner.RunAsync(
+            LibraryPath,
             arguments,
-            WorkingDirectory,
-            BuildEnvironment(),
+            Options.EnvironmentVariables,
             Options.RunTimeout,
             SeasonThreeD.LogCallback,
             progress,
             cancellationToken);
-
-    /// <summary>
-    /// The caller's variables, plus a PATH that reaches the app when the worker lives below
-    /// it. A NuGet consumer gets the worker in runtimes\&lt;rid&gt;\native while
-    /// cudacudnn-runtime (cudart64_12 / cublas64_12, which ggml-cuda.dll imports) is staged
-    /// in the output root, and the loader would not look there for a process started from
-    /// the subfolder. ggml itself needs no help: SeasonGGML mirrors the same RID folder into
-    /// the package, so ggml.dll sits beside the worker either way, and ggml's backend loader
-    /// scans the executable's own directory. A PATH the caller set is passed through
-    /// untouched.
-    /// </summary>
-    private Dictionary<string, string>? BuildEnvironment()
-    {
-        var environment = Options.EnvironmentVariables is null
-            ? null
-            : new Dictionary<string, string>(Options.EnvironmentVariables, StringComparer.OrdinalIgnoreCase);
-
-        if (environment?.ContainsKey("PATH") == true)
-        {
-            return environment;
-        }
-
-        var workerDirectory = Path.GetDirectoryName(ExecutablePath);
-        var baseDirectory = Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory);
-
-        if (string.IsNullOrEmpty(workerDirectory) ||
-            string.Equals(Path.TrimEndingDirectorySeparator(workerDirectory), baseDirectory, StringComparison.OrdinalIgnoreCase))
-        {
-            return environment;
-        }
-
-        environment ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        environment["PATH"] = string.Join(
-            Path.PathSeparator,
-            workerDirectory,
-            baseDirectory,
-            Environment.GetEnvironmentVariable("PATH") ?? string.Empty);
-
-        return environment;
-    }
 
     /// <summary>
     /// Whether the worker gave up while initializing an explicitly requested backend.
@@ -190,16 +148,16 @@ public sealed class TrellisSession : IDisposable
     /// starts: "backend '&lt;name&gt;' failed to initialize" and "unknown backend:
     /// &lt;name&gt;" (the latter after "no backend named ..." in this build).
     /// </summary>
-    private static bool IsBackendInitFailure(TrellisProcessOutcome outcome)
+    private static bool IsBackendInitFailure(TrellisRunOutcome outcome)
         => outcome.ErrorLines.Any(static line =>
             line.Contains("failed to initialize", StringComparison.Ordinal) ||
             line.Contains("unknown backend", StringComparison.Ordinal));
 
-    private string BuildFailureMessage(TrellisProcessOutcome outcome)
+    private string BuildFailureMessage(TrellisRunOutcome outcome)
     {
         var builder = new StringBuilder();
-        builder.Append(Path.GetFileName(ExecutablePath));
-        builder.Append(" exited with code ");
+        builder.Append(Path.GetFileName(LibraryPath));
+        builder.Append(" returned code ");
         builder.Append(outcome.ExitCode.ToString(CultureInfo.InvariantCulture));
         builder.Append(" after ");
         builder.Append(outcome.Duration.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture));

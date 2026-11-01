@@ -5,9 +5,9 @@
 namespace Season.ThreeD;
 
 /// <summary>
-/// Translates the managed options into trellis-cli arguments. Validation mirrors what
+/// Translates the managed options into trellis arguments. Validation mirrors what
 /// <c>trellis_args.cpp</c> enforces so that a bad request fails here, with a managed
-/// stack trace and no worker startup, instead of surfacing as exit code 1 plus a
+/// stack trace and no native call, instead of surfacing as exit code 1 plus a
 /// one-line usage dump.
 /// </summary>
 internal static class TrellisCommandLine
@@ -334,7 +334,7 @@ internal static class TrellisCommandLine
         if (options.Faces is not null && options.DecimationGrid is not null)
         {
             throw new ArgumentException(
-                "Faces and DecimationGrid are mutually exclusive; trellis-cli rejects --faces together with --decim.",
+                "Faces and DecimationGrid are mutually exclusive; trellis rejects --faces together with --decim.",
                 nameof(options));
         }
 

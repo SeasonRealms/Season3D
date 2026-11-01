@@ -5,26 +5,30 @@
 namespace Season.ThreeD;
 
 /// <summary>
-/// Finds the trellis worker. Unlike the other Season AI packages this is not a native
-/// library next to the managed assembly only: the workflow publishes the executables
-/// into <c>runtimes/&lt;rid&gt;/native</c>, MSBuild keeps that folder in a Windows output
-/// (the worker brings its own ggml, see SeasonThreeD.csproj) and flattens the Linux one
-/// into the output root, and a developer may keep a local build anywhere - so the search
-/// covers all three, plus PATH.
+/// Finds the trellis native library. The workflow publishes it into
+/// <c>runtimes/&lt;rid&gt;/native</c>, MSBuild flattens that folder into a Windows output
+/// (the library resolves ggml from the application directory, see SeasonThreeD.csproj),
+/// and a developer may keep a local build anywhere - so the search covers all three, plus
+/// PATH.
 ///
 /// Two lanes are published from one build (see
 /// <c>.github/workflows/build-trellis.yml</c>) and the packaging step tells them apart by
-/// file name, so the lane is a property of the file a caller selected rather than
-/// something it has to remember: <c>trellis-cli</c> is the CUDA lane and
-/// <c>trellis-cli-vulkan</c> the Vulkan one.
+/// file name, so the lane is a property of the library a caller selected rather than
+/// something it has to remember: <c>trellis</c> is the CUDA lane and
+/// <c>trellis-vulkan</c> the Vulkan one. Only the dll is shipped - the same
+/// <c>trellis_run_argv</c> lives in both the dll and the exe, and the dll is the form that
+/// has an equivalent on every platform.
 /// </summary>
 internal static class TrellisRuntimeLocator
 {
-    internal const string EnvironmentVariable = "SEASONTHREED_TRELLIS_CLI";
+    internal const string EnvironmentVariable = "SEASONTHREED_TRELLIS_LIBRARY";
+
+    /// <summary>The pre-dll override; still honoured so an existing deployment keeps working.</summary>
+    internal const string LegacyEnvironmentVariable = "SEASONTHREED_TRELLIS_CLI";
 
     // The CUDA lane keeps the plain name so callers that predate the split keep working.
-    internal const string PrimaryExecutableBaseName = "trellis-cli";
-    internal const string VulkanExecutableBaseName = "trellis-cli-vulkan";
+    internal const string PrimaryLibraryBaseName = "trellis";
+    internal const string VulkanLibraryBaseName = "trellis-vulkan";
 
     /// <summary>
     /// Where the NVIDIA driver library lives on Linux. Its presence is what tells
@@ -53,7 +57,7 @@ internal static class TrellisRuntimeLocator
             if (!File.Exists(full))
             {
                 throw new FileNotFoundException(
-                    $"The trellis worker executable was not found at the configured path: {full}", full);
+                    $"The trellis native library was not found at the configured path: {full}", full);
             }
 
             return full;
@@ -72,7 +76,7 @@ internal static class TrellisRuntimeLocator
         }
 
         // The override names one file, so it only answers for Auto: a caller that asked
-        // for a specific lane gets that lane's binary or an honest "not installed".
+        // for a specific lane gets that lane's library or an honest "not installed".
         if (worker == TrellisWorker.Auto && TryResolveFromEnvironment() is { } fromEnvironment)
         {
             return fromEnvironment;
@@ -82,9 +86,9 @@ internal static class TrellisRuntimeLocator
     }
 
     /// <summary>
-    /// The lanes whose executable is present, in the order <see cref="TrellisWorker.Auto"/>
+    /// The lanes whose library is present, in the order <see cref="TrellisWorker.Auto"/>
     /// prefers them. Lets a caller offer "CUDA or Vulkan" on a machine that has both
-    /// without starting either.
+    /// without loading either.
     /// </summary>
     public static IReadOnlyList<TrellisWorker> AvailableWorkers()
     {
@@ -108,9 +112,10 @@ internal static class TrellisRuntimeLocator
     /// The lane a resolved path belongs to. Read off the file name, because that is what
     /// Package() in build-trellis.yml renames - a custom path is classified the same way,
     /// which keeps "which lane am I running?" a string comparison rather than a probe.
+    /// <c>libtrellis-vulkan.so</c> classifies the same as <c>trellis-vulkan.dll</c>.
     /// </summary>
-    internal static TrellisWorker DetectLane(string executablePath)
-        => Path.GetFileNameWithoutExtension(executablePath)
+    internal static TrellisWorker DetectLane(string libraryPath)
+        => Path.GetFileNameWithoutExtension(libraryPath)
             .EndsWith("-vulkan", StringComparison.OrdinalIgnoreCase)
                 ? TrellisWorker.Vulkan
                 : TrellisWorker.Cuda;
@@ -135,22 +140,29 @@ internal static class TrellisRuntimeLocator
 
     private static string? TryResolveFromEnvironment()
     {
-        var fromEnvironment = Environment.GetEnvironmentVariable(EnvironmentVariable);
-        if (string.IsNullOrWhiteSpace(fromEnvironment))
+        foreach (var name in new[] { EnvironmentVariable, LegacyEnvironmentVariable })
         {
-            return null;
+            var fromEnvironment = Environment.GetEnvironmentVariable(name);
+            if (string.IsNullOrWhiteSpace(fromEnvironment))
+            {
+                continue;
+            }
+
+            try
+            {
+                var candidate = Path.GetFullPath(fromEnvironment);
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+            catch (ArgumentException)
+            {
+                // A malformed override is ignored rather than breaking discovery.
+            }
         }
 
-        try
-        {
-            var candidate = Path.GetFullPath(fromEnvironment);
-            return File.Exists(candidate) ? candidate : null;
-        }
-        catch (ArgumentException)
-        {
-            // A malformed override is ignored rather than breaking discovery.
-            return null;
-        }
+        return null;
     }
 
     private static string? TryResolveInLayouts(TrellisWorker worker)
@@ -178,16 +190,16 @@ internal static class TrellisRuntimeLocator
 
         return $"{expected} was not found. Expected it next to the managed assembly, under " +
                $"runtimes/{GetRuntimeIdentifier()}/native, on PATH, or named by {EnvironmentVariable} " +
-               $"(Auto only). Build it with .github/workflows/build-trellis.yml and copy the artifact " +
+               $"(Auto only). Build it with .github/workflows/build-trellis.yml and copy the dll " +
                "next to the app.";
     }
 
     /// <summary>
     /// The two layouts a consumer sees: the RID layout (the NuGet package payload) and the
-    /// flat output root (a project reference links the executables there, beside the ggml
-    /// SeasonGGML copies to that same root - the worker and its ggml must stay together,
-    /// because ggml resolves its imports and its backend modules from the executable's
-    /// directory). The RID folder still goes first so a packaged worker wins over a stale
+    /// flat output root (a project reference links the library there, beside the ggml
+    /// SeasonGGML copies to that same root - the library and its ggml must stay together,
+    /// because ggml resolves its imports and its backend modules from the application's
+    /// directory). The RID folder still goes first so a packaged library wins over a stale
     /// copy an older build left in the root.
     /// </summary>
     private static IEnumerable<string> EnumerateSearchDirectories()
@@ -201,12 +213,19 @@ internal static class TrellisRuntimeLocator
     {
         foreach (var baseName in EnumerateBaseNames(worker))
         {
-            yield return OperatingSystem.IsWindows() ? baseName + ".exe" : baseName;
-            // A Windows payload unpacked on a non-Windows host still resolves the managed
-            // path but cannot run; keep the probe honest by only adding the bare name.
             if (OperatingSystem.IsWindows())
             {
-                yield return baseName;
+                yield return baseName + ".dll";
+            }
+            else if (OperatingSystem.IsMacOS())
+            {
+                yield return "lib" + baseName + ".dylib";
+            }
+            else
+            {
+                // CMake's OUTPUT_NAME is trellis, so the shared object carries the lib
+                // prefix even though the dll and the dylib are named for the module.
+                yield return "lib" + baseName + ".so";
             }
         }
     }
@@ -221,21 +240,21 @@ internal static class TrellisRuntimeLocator
         switch (worker)
         {
             case TrellisWorker.Cuda:
-                yield return PrimaryExecutableBaseName;
+                yield return PrimaryLibraryBaseName;
                 break;
             case TrellisWorker.Vulkan:
-                yield return VulkanExecutableBaseName;
+                yield return VulkanLibraryBaseName;
                 break;
             default:
                 if (IsCudaDriverPresent())
                 {
-                    yield return PrimaryExecutableBaseName;
-                    yield return VulkanExecutableBaseName;
+                    yield return PrimaryLibraryBaseName;
+                    yield return VulkanLibraryBaseName;
                 }
                 else
                 {
-                    yield return VulkanExecutableBaseName;
-                    yield return PrimaryExecutableBaseName;
+                    yield return VulkanLibraryBaseName;
+                    yield return PrimaryLibraryBaseName;
                 }
 
                 break;
