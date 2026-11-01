@@ -57,10 +57,10 @@ name: build-trellis.yml
 #                    ggml_tensor and the backend vtables across the boundary, so a
 #                    revision skew surfaces as STATUS_ENTRYPOINT_NOT_FOUND or as
 #                    silent corruption. It defaults to SeasonRealms/ggml `master`,
-#                    which carries upstream 0.27.0 plus the patches trellis.cpp's
+#                    which carries upstream 0.28.0 plus the patches trellis.cpp's
 #                    results depend on (fastdiv UB above 2^31, GGML_PREC_F32 honoured
 #                    in the TILE / VEC / MMA FlashAttention kernels, and the
-#                    GGML_FA_DEBUG dispatch line). Plain upstream 0.27 compiles and
+#                    GGML_FA_DEBUG dispatch line). Plain upstream 0.28 compiles and
 #                    links, then returns a different latent: res-1024 dense scenes
 #                    take a GPU page fault in fastdiv and the FA bias goes 13x
 #                    (NVIDIA MMA) or ~120 sigma (AMD TILE) out - so point this at a
